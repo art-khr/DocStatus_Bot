@@ -1,0 +1,23 @@
+services:
+  docstatus-bot:
+    build: .
+    image: docstatus-bot:latest
+    container_name: docstatus-bot
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Tashkent
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+        reservations:
+          memory: 32M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

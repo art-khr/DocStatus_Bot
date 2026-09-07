@@ -1,0 +1,11 @@
+.git
+.gitignore
+logs
+README.md
+requirements.txt
+start_bot.bat
+Dockerfile
+.dockerignore
+docker-compose.yml
+__pycache__
+*.pyc

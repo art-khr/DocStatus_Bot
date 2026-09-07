@@ -1,0 +1,142 @@
+{
+  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "allowed_chat_ids": [123456789],
+  "request_timeout_seconds": 20,
+  "cache_seconds": 30,
+  "health_doc_number": "0",
+
+  "smartup": {
+    "url": "https://smartup.example.com",
+    "path": "b/trade/txs/tdeal/order$export",
+    "username": "SMARTUP_USERNAME",
+    "password": "SMARTUP_PASSWORD"
+  },
+
+  "accounting": {
+    "url": "http://ACCOUNTING_HOST/meros_bot/hs/imzo_bot/proverkabuh/",
+    "username": "ACCOUNTING_USERNAME",
+    "password": "ACCOUNTING_PASSWORD"
+  },
+
+  "regions": [
+    {
+      "name": "Ташкент",
+      "warehouse_name": "Склад Ташкент",
+      "warehouse_codes": ["4"],
+      "wms_responsible": "Склад Ташкент",
+      "tms_responsible": "Логистика Ташкент",
+      "wms": {
+        "url": "http://WMS_HOST/SkladTash/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Андижан",
+      "warehouse_name": "Склад Андижан",
+      "warehouse_codes": ["12"],
+      "wms_responsible": "Склад Андижан",
+      "tms_responsible": "Логистика Андижан",
+      "wms": {
+        "url": "http://WMS_HOST/sklad/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Карши",
+      "warehouse_name": "Склад Карши",
+      "warehouse_codes": ["555"],
+      "wms_responsible": "Склад Карши",
+      "tms_responsible": "Логистика Карши",
+      "wms": {
+        "url": "http://WMS_HOST/sklad/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Фергона",
+      "warehouse_name": "Склад Фергана",
+      "warehouse_codes": ["6"],
+      "wms_responsible": "Склад Фергона",
+      "tms_responsible": "Логистика Фергона",
+      "wms": {
+        "url": "http://WMS_HOST/sklad/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Ургенч",
+      "warehouse_name": "Склад Ургенч",
+      "warehouse_codes": ["5"],
+      "wms_responsible": "Склад Ургенч",
+      "tms_responsible": "Логистика Ургенч",
+      "wms": {
+        "url": "http://WMS_HOST:4004/sklad/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST:4004/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Наманган",
+      "warehouse_name": "Склад Наманган",
+      "warehouse_codes": ["8"],
+      "wms_responsible": "Склад Наманган",
+      "tms_responsible": "Логистика Наманган",
+      "wms": {
+        "url": "http://WMS_HOST/sklsd/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    },
+    {
+      "name": "Самарканд",
+      "warehouse_name": "Склад Самарканд",
+      "warehouse_codes": ["444"],
+      "wms_responsible": "Склад Самарканд",
+      "tms_responsible": "Логистика Самарканд",
+      "wms": {
+        "url": "http://WMS_HOST/SkladSam/hs/ObmenSUT/proverkadoc/",
+        "username": "WMS_USERNAME",
+        "password": "WMS_PASSWORD"
+      },
+      "tms": {
+        "url": "http://TMS_HOST/otgruzka/hs/imzo_bot/transport_control/",
+        "username": "TMS_USERNAME",
+        "password": "TMS_PASSWORD"
+      }
+    }
+  ]
+}
