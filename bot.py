@@ -6,7 +6,6 @@ import re
 import sys
 import time
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -740,26 +739,13 @@ def handle_message(config, message):
 
 
 def setup_logging():
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-
-    file_handler = RotatingFileHandler(
-        log_dir / "bot.log",
-        maxBytes=2 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
+    """Логи пишутся в stdout: их собирает и ротирует Docker (docker compose logs)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stdout,
+        force=True,
     )
-    file_handler.setFormatter(formatter)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()
-    root_logger.addHandler(console)
-    root_logger.addHandler(file_handler)
 
 
 def main():

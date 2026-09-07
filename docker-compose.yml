@@ -6,7 +6,6 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.json:/app/config.json:ro
-      - ./logs:/app/logs
     environment:
       - TZ=Asia/Tashkent
     deploy:
@@ -16,8 +15,9 @@ services:
           memory: 128M
         reservations:
           memory: 32M
+    # Логи собирает Docker: docker compose logs -f
     logging:
       driver: json-file
       options:
-        max-size: "5m"
+        max-size: "10m"
         max-file: "3"

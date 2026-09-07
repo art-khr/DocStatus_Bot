@@ -1,6 +1,5 @@
 .git
 .gitignore
-logs
 README.md
 requirements.txt
 start_bot.bat

@@ -8,7 +8,6 @@ WORKDIR /app
 # Бот использует только стандартную библиотеку Python — зависимости не нужны.
 COPY bot.py .
 
-RUN adduser -D -H bot && mkdir -p /app/logs && chown -R bot:bot /app
-USER bot
+USER nobody
 
 CMD ["python", "bot.py"]
