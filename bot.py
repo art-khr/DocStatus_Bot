@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import base64
+import html
 import json
 import logging
+import math
 import re
 import sys
 import time
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -15,6 +19,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
+ACCESS_PATH = ROOT / "access.json"
 DOC_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._/-]{1,50}$")
 CACHE = {}
 WAREHOUSE_CACHE = {"loaded_at": 0.0, "items": {}, "error": ""}
@@ -24,9 +29,21 @@ BUTTON_CHECK = "🔍 Проверить заявку"
 BUTTON_HELP = "ℹ️ Инструкция"
 BUTTON_HEALTH = "🩺 Состояние систем"
 BUTTON_CANCEL = "❌ Отмена"
+BUTTON_REGISTER = "📝 Запросить доступ"
+BUTTON_CHAT_ID = "🆔 ID чата"
 
 
-def main_keyboard():
+def main_keyboard(allowed=False):
+    if not allowed:
+        return {
+            "keyboard": [
+                [{"text": BUTTON_REGISTER}],
+                [{"text": BUTTON_HELP}, {"text": BUTTON_CHAT_ID}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Запросите доступ к проверке заявок",
+        }
     return {
         "keyboard": [
             [{"text": BUTTON_CHECK}],
@@ -38,22 +55,70 @@ def main_keyboard():
     }
 
 
+def force_reply_keyboard():
+    return {
+        "force_reply": True,
+        "selective": True,
+        "input_field_placeholder": "Один или несколько ID заявок",
+    }
+
+
 def help_text():
     return (
         "Как пользоваться ботом:\n\n"
         "1. Нажмите «🔍 Проверить заявку».\n"
-        "2. Отправьте ID заявки из Smartup.\n"
+        "2. Отправьте один или несколько ID заявок из Smartup.\n"
         "3. Бот покажет текущую стадию, склад и найденные проблемы.\n\n"
-        "Можно сразу отправить номер заявки без нажатия кнопки.\n\n"
+        "Несколько номеров можно отправить через пробел, запятую или каждый с новой строки.\n"
+        "Можно сразу использовать команду /check 4411939 4411940.\n\n"
         "Ответственные по стадиям:\n"
         "• Черновик — оператор завершает оформление.\n"
         "• Новый — оператор переводит заявку в обработку.\n"
         "• В обработке — проверка финансовым отделом.\n"
-        "• В ожидании — склад должен принять заявку в WMS.\n"
-        "• Отгружен или Доставлен — проверяется сборка в WMS.\n"
+        "• В ожидании — проверяются ордер, БЯС, сборка, корзина и серии.\n"
+        "• Отгружен или Доставлен — проверяются сборка, корзина и серии.\n"
         "• Архивирован — проверяются бухгалтерия и отправка ЭСФ.\n\n"
+        "Если ордер или БЯС не найдены, сборка не завершена, в корзине остался товар "
+        "или серии не совпали — обратитесь на склад.\n\n"
         "Проверка TMS временно отключена."
     )
+
+
+def load_access_state():
+    empty = {"approved_chat_ids": [], "pending": {}}
+    if not ACCESS_PATH.exists():
+        return empty
+    try:
+        with ACCESS_PATH.open("r", encoding="utf-8") as stream:
+            data = json.load(stream)
+        approved = data.get("approved_chat_ids", [])
+        pending = data.get("pending", {})
+        if not isinstance(approved, list) or not isinstance(pending, dict):
+            raise ValueError("неверная структура")
+        return {
+            "approved_chat_ids": [str(item) for item in approved],
+            "pending": pending,
+        }
+    except Exception as error:
+        logging.error("Не удалось прочитать access.json: %s", error)
+        return empty
+
+
+def save_access_state(state):
+    temp_path = ACCESS_PATH.with_suffix(".json.tmp")
+    with temp_path.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    temp_path.replace(ACCESS_PATH)
+
+
+def admin_ids(config):
+    configured = config.get("admin_chat_ids")
+    if configured is None:
+        configured = config.get("allowed_chat_ids", [])
+    if isinstance(configured, (str, int)):
+        configured = [configured]
+    return {str(item) for item in configured}
 
 
 def load_config():
@@ -109,10 +174,250 @@ def request_json(service, doc_number, timeout):
 
     try:
         data = json.loads(body)
-        return data if isinstance(data, dict) else {"_error": "ответ JSON не является объектом"}
+        if not isinstance(data, dict):
+            return {"_error": "ответ JSON не является объектом"}
+        if data.get("error"):
+            return {"_error": str(data["error"])}
+        return data
     except json.JSONDecodeError:
         logging.error("Получен не JSON; URL=%s; body=%s", url, body[:3000])
         return {"_error": "база вернула не JSON"}
+
+
+
+def normalize_wms(data):
+    """Validate the service contract; never interpret missing fields as False."""
+    if not isinstance(data, dict):
+        return {"_error": "ответ WMS не является объектом"}
+    if data.get("_error"):
+        return data
+    if data.get("error"):
+        return {"_error": str(data["error"])}
+    result = dict(data)
+    fields = (
+        ("document_found", ("order_found", "document_found")),
+        ("assembly_found", ("assembly_found",)),
+        ("assembled", ("assembly_completed", "assembled")),
+    )
+    for target, aliases in fields:
+        value = next((data[key] for key in aliases if key in data), None)
+        if not isinstance(value, bool):
+            return {"_error": f"WMS не вернула логическое поле {target}"}
+        result[target] = value
+    quantity = data.get("basket_quantity")
+    if (type(quantity) not in (int, float)
+            or (isinstance(quantity, float) and not math.isfinite(quantity))
+            or quantity < 0):
+        return {"_error": "WMS не вернула корректное числовое поле basket_quantity"}
+    flag = data.get("basket_has_items", False)
+    if not isinstance(flag, bool):
+        return {"_error": "WMS вернула неверный тип basket_has_items"}
+    result["basket_has_items"] = flag or quantity > 0
+    raw_finished = data.get("assembly_finished", result["assembled"])
+    result["assembly_finished"] = raw_finished if isinstance(raw_finished, bool) else result["assembled"]
+    result["assembled"] = (
+        result["document_found"] and result["assembly_found"]
+        and result["assembly_finished"] and not result["basket_has_items"]
+    )
+
+    result["assembly_items_available"] = "assembly_items" in data
+    result["series_data_error"] = ""
+    assembly_items = data.get("assembly_items", [])
+    if not isinstance(assembly_items, list):
+        result["assembly_items_available"] = False
+        result["series_data_error"] = "WMS вернула неверный формат assembly_items"
+        assembly_items = []
+    elif any(not isinstance(item, dict) for item in assembly_items):
+        result["assembly_items_available"] = False
+        result["series_data_error"] = "WMS вернула некорректные строки assembly_items"
+        assembly_items = []
+    result["assembly_items"] = assembly_items
+    # Keep supported aliases consistent with the calculated result.
+    result["order_found"] = result["document_found"]
+    result["assembly_completed"] = result["assembled"]
+    return result
+
+
+def request_wms(service, doc_number, timeout):
+    return normalize_wms(request_json(service, doc_number, timeout))
+
+
+def decimal_value(value):
+    if isinstance(value, bool) or value is None:
+        raise InvalidOperation
+    text = str(value).strip().replace(" ", "").replace(",", ".")
+    return Decimal(text)
+
+
+def series_key(product_code, series):
+    return str(product_code or "").strip().casefold(), str(series or "").strip().casefold()
+
+
+def display_quantity(value):
+    number = Decimal(value)
+    if number == number.to_integral_value():
+        return str(int(number))
+    return format(number.normalize(), "f")
+
+
+def compare_series(smartup, wms):
+    if not wms.get("assembly_items_available"):
+        return {
+            "available": False,
+            "matches": False,
+            "issues": [wms.get("series_data_error") or "WMS не вернула состав сборки"],
+        }
+
+    order = smartup.get("order", {})
+    products = order.get("order_products", []) if isinstance(order, dict) else []
+    if not isinstance(products, list):
+        return {"available": False, "matches": False, "issues": ["Smartup не вернул товары заявки"]}
+    if not products:
+        return {"available": False, "matches": False, "issues": ["Smartup вернул пустой список товаров"]}
+
+    expected = {}
+    actual = {}
+    labels = {}
+    data_issues = []
+
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        code = str(product.get("product_code") or "").strip()
+        series = str(product.get("card_code") or "").strip()
+        name = str(product.get("product_name") or product.get("name") or "").strip()
+        quantity = next(
+            (product.get(field) for field in ("sold_quant", "quantity", "order_quant") if product.get(field) is not None),
+            None,
+        )
+        if not code:
+            data_issues.append("В Smartup есть товар без product_code")
+            continue
+        if not series:
+            data_issues.append(f"В Smartup не указана серия: {name or code}")
+            continue
+        try:
+            number = decimal_value(quantity)
+        except (InvalidOperation, ValueError):
+            data_issues.append(f"В Smartup не указано количество: {name or code}, серия {series}")
+            continue
+        key = series_key(code, series)
+        expected[key] = expected.get(key, Decimal(0)) + number
+        labels[key] = (code, series, name)
+
+    for item in wms.get("assembly_items", []):
+        code = str(item.get("product_code") or "").strip()
+        series = str(item.get("series") or "").strip()
+        name = str(item.get("product_name") or "").strip()
+        if not code:
+            data_issues.append("В WMS есть строка сборки без product_code")
+            continue
+        if not series:
+            data_issues.append(f"В WMS не указана серия: {name or code}")
+            continue
+        try:
+            number = decimal_value(item.get("quantity"))
+        except (InvalidOperation, ValueError):
+            data_issues.append(f"В WMS не указано количество: {name or code}, серия {series}")
+            continue
+        key = series_key(code, series)
+        actual[key] = actual.get(key, Decimal(0)) + number
+        labels.setdefault(key, (code, series, name))
+
+    issues = list(dict.fromkeys(data_issues))
+    for key in sorted(set(expected) | set(actual)):
+        code, series, name = labels[key]
+        product = f"{name} ({code})" if name else code
+        expected_quantity = expected.get(key, Decimal(0))
+        actual_quantity = actual.get(key, Decimal(0))
+        if key not in actual:
+            issues.append(
+                f"Нет в сборке: {product}, серия {series}, ожидалось {display_quantity(expected_quantity)}"
+            )
+        elif key not in expected:
+            issues.append(
+                f"Лишняя серия в сборке: {product}, серия {series}, количество {display_quantity(actual_quantity)}"
+            )
+        elif expected_quantity != actual_quantity:
+            issues.append(
+                f"Количество не совпало: {product}, серия {series}; "
+                f"Smartup {display_quantity(expected_quantity)}, WMS {display_quantity(actual_quantity)}"
+            )
+
+    return {"available": True, "matches": not issues, "issues": issues}
+
+
+def format_wms(wms, status_code, responsible="", series_check=None):
+    wms = normalize_wms(wms)
+    if wms.get("_error"):
+        return [f"❌ Не удалось проверить WMS: {describe_error(wms['_error'])}"], 0, 1
+    lines = []
+    action = ""
+    problems = 0
+    warehouse_contact = False
+    if not wms["document_found"]:
+        lines.append("❌ WMS: расходный ордер не найден")
+        action = "Обратитесь на склад"
+        problems = 1
+        warehouse_contact = True
+    else:
+        lines.append("✅ WMS: расходный ордер найден")
+        if not wms["assembly_found"]:
+            lines.append("⚠️ БЯС не найдена")
+            action = "Обратитесь на склад"
+            problems = 1
+            warehouse_contact = True
+        elif not wms["assembly_finished"]:
+            lines.extend(["✅ БЯС найдена", "⚠️ Сборка товара не завершена"])
+            action = "Обратитесь на склад"
+            problems = 1
+            warehouse_contact = True
+        else:
+            lines.extend(["✅ БЯС найдена", "✅ Сборка завершена"])
+            if wms["basket_has_items"]:
+                action = "Обратитесь на склад: товар необходимо убрать из корзины"
+                problems = 1
+                warehouse_contact = True
+            elif series_check and not series_check.get("available"):
+                lines.append("⚠️ Сверка серий не выполнена")
+                for issue in series_check.get("issues", [])[:3]:
+                    lines.append(f"   • {issue}")
+                action = "Обратитесь на склад"
+                problems = 1
+                warehouse_contact = True
+            elif series_check and not series_check.get("matches"):
+                lines.append("❌ Серии Smartup и WMS не совпадают")
+                for issue in series_check.get("issues", [])[:8]:
+                    lines.append(f"   • {issue}")
+                extra = len(series_check.get("issues", [])) - 8
+                if extra > 0:
+                    lines.append(f"   • Ещё расхождений: {extra}")
+                action = "Обратитесь на склад: проверьте серии товара внутри сборки"
+                problems = 1
+                warehouse_contact = True
+            elif series_check and series_check.get("matches"):
+                lines.append("✅ Серии Smartup и WMS совпадают")
+            else:
+                lines.append("⚠️ Сверка серий не выполнена")
+                action = "Обратитесь на склад"
+                problems = 1
+                warehouse_contact = True
+
+            if not action and status_code == "B#W":
+                action = "Заявка всё ещё находится в ожидании. Обратитесь на склад"
+                problems = 1
+                warehouse_contact = True
+            elif not action and status_code == "B#S":
+                action = "Обратитесь на склад для перевода заявки в статус «Доставлен»"
+                problems = 1
+                warehouse_contact = True
+            elif not action and status_code == "B#V":
+                action = "Передайте заявку в бухгалтерию для архивирования"
+                problems = 1
+    quantity = wms["basket_quantity"]
+    if quantity > 0:
+        lines.append(f"❌ В корзине осталось товара: {quantity:,}".replace(",", " ").removesuffix(".0"))
+    return lines, problems, 0
 
 
 def request_smartup(service, doc_number, timeout):
@@ -259,17 +564,23 @@ def request_smartup_warehouses(service, timeout):
             return {}, WAREHOUSE_CACHE["error"]
 
         page_rows = response_data.get("data", []) if isinstance(response_data, dict) else []
-        total_count = int(response_data.get("count", 0)) if isinstance(response_data, dict) else 0
+        if not isinstance(response_data, dict) or response_data.get("error") or not isinstance(response_data.get("data"), list):
+            return {}, "Smartup вернул некорректный справочник складов"
+        raw_count = response_data.get("count")
+        try:
+            total_count = int(raw_count) if raw_count is not None else None
+        except (TypeError, ValueError):
+            total_count = None
         rows.extend(page_rows)
 
-        if not page_rows or len(rows) >= total_count or len(page_rows) < limit:
+        if not page_rows or (total_count is not None and total_count > 0 and len(rows) >= total_count) or len(page_rows) < limit:
             break
 
         offset += limit
 
     warehouses = {}
     for row in rows:
-        if not isinstance(row, list) or len(row) < 8:
+        if not isinstance(row, list) or len(row) < 3:
             continue
 
         code = str(row[1] or "").strip()
@@ -280,9 +591,9 @@ def request_smartup_warehouses(service, timeout):
             "id": str(row[0] or "").strip(),
             "code": code,
             "name": str(row[2] or "").strip(),
-            "region": str(row[3] or "").strip(),
-            "responsible": str(row[4] or "").strip(),
-            "active": str(row[6] or "").strip().upper() == "A",
+            "region": str(row[3] or "").strip() if len(row) > 3 else "",
+            "responsible": str(row[4] or "").strip() if len(row) > 4 else "",
+            "active": str(row[6] or "").strip().upper() == "A" if len(row) > 6 else True,
         }
 
     if not warehouses:
@@ -375,25 +686,15 @@ def responsible_line(name):
     return f"   Ответственный: {name}" if name else ""
 
 
-def format_region(region_name, wms, tms, wms_responsible="", tms_responsible=""):
+def format_region(region_name, wms, tms, wms_responsible="", tms_responsible="", series_check=None):
     lines = [f"📍 Регион: {region_name}"]
     problems = 0
     unavailable = 0
 
-    if wms.get("_error"):
-        lines.append(f"❌ WMS недоступна: {describe_error(wms['_error'])}")
-        unavailable += 1
-    else:
-        found = bool_value(wms, "order_found", "document_found")
-        assembled = bool_value(wms, "assembly_completed", "assembled")
-        lines.append("✅ WMS: ордер найден" if found else "❌ WMS: ордер не найден")
-        if found:
-            lines.append("✅ WMS: сборка завершена" if assembled else "⚠️ WMS: сборка не завершена")
-        if not found or not assembled:
-            problems += 1
-            owner = responsible_line(wms_responsible)
-            if owner:
-                lines.append(owner)
+    wms_lines, wms_problems, wms_unavailable = format_wms(wms, "", wms_responsible, series_check)
+    lines.extend(wms_lines)
+    problems += wms_problems
+    unavailable += wms_unavailable
 
     if tms.get("_error"):
         lines.append(f"❌ TMS недоступна: {describe_error(tms['_error'])}")
@@ -424,26 +725,76 @@ def region_has_order(region_result):
     )
 
 
+def add_unique(items, value):
+    value = str(value or "").strip()
+    if value and value not in items:
+        items.append(value)
+
+
+def wms_summary(wms, status_code, series_check=None, responsible=""):
+    normalized = normalize_wms(wms)
+    owner = str(responsible or "склад").strip()
+    if normalized.get("_error"):
+        return "Не удалось получить данные из WMS", "Повторить проверку или обратиться на склад", owner
+    if not normalized["document_found"]:
+        return "Расходный ордер не найден в WMS", "Обратиться на склад", owner
+    if not normalized["assembly_found"]:
+        return "БЯС по заявке не найдена", "Обратиться на склад", owner
+    if not normalized["assembly_finished"]:
+        return "Сборка товара не завершена", "Склад должен завершить сборку", owner
+    if normalized["basket_has_items"]:
+        quantity = normalized.get("basket_quantity", 0)
+        return f"В корзине осталось товара: {quantity:g}", "Склад должен убрать товар из корзины", owner
+    if series_check and not series_check.get("available"):
+        return "Не удалось проверить серии товара", "Обратиться на склад", owner
+    if series_check and not series_check.get("matches"):
+        return "Серии или количество товара в Smartup и WMS не совпадают", "Склад должен проверить товар внутри сборки", owner
+    if series_check is None:
+        return "Сверка серий не выполнена", "Обратиться на склад", owner
+    if status_code == "B#W":
+        return "Сборка завершена, но заявка всё ещё находится в ожидании", "Склад должен перевести заявку дальше", owner
+    if status_code == "B#S":
+        return "Заявка ещё не переведена в статус «Доставлен»", "Обратиться на склад", owner
+    if status_code == "B#V":
+        return "Доставленная заявка ещё не архивирована", "Передать заявку в бухгалтерию", "бухгалтерия"
+    return "", "", ""
+
+
 def format_result(doc_number, results):
     lines = [f"Заявка {doc_number}", ""]
     problems = 0
     unavailable = 0
     cancelled = False
+    problem_reasons = []
+    required_actions = []
+    responsible_people = []
+    unavailable_reasons = []
 
     smartup = results.get("smartup", {})
     if smartup.get("_error"):
         lines.append(f"❌ Smartup недоступен: {describe_error(smartup['_error'])}")
         unavailable = 1
         lines.append("➡️ Невозможно определить, какую систему нужно проверять")
+        lines.append("👤 Ответственный: администратор интеграции")
+        add_unique(unavailable_reasons, "Smartup недоступен")
+        add_unique(required_actions, "Обратиться к администратору интеграции")
+        add_unique(responsible_people, "администратор интеграции")
     elif not bool_value(smartup, "document_found"):
         lines.append("❌ Smartup: заявка не найдена")
         problems = 1
         lines.append("➡️ Проверьте правильность номера заявки")
+        lines.append("👤 Если номер верный — обратитесь к оператору")
+        add_unique(problem_reasons, "Заявка не найдена в Smartup")
+        add_unique(required_actions, "Проверить номер заявки; если он верный — обратиться к оператору")
+        add_unique(responsible_people, "оператор")
     else:
         status_code = str(smartup.get("status_code") or "").strip().upper()
         status_name = str(smartup.get("status") or "Статус не указан")
         lines.append("✅ Smartup: заявка найдена")
         lines.append(f"📌 Стадия заявки: {status_name}")
+        order_date = str(smartup.get("order", {}).get("deal_time") or "").strip()
+        if order_date:
+            lines.append(f"📅 Дата заявки: {order_date}")
 
         warehouse_codes = results.get("warehouse_codes", [])
         warehouse_names = results.get("warehouse_names", [])
@@ -455,56 +806,73 @@ def format_result(doc_number, results):
         if status_code == "C":
             lines.append("🚫 Заявка отменена")
             lines.append("➡️ Проверки WMS и бухгалтерии не требуются")
+            lines.append("👤 По вопросам отмены обратитесь к оператору")
             cancelled = True
 
         elif status_code == "D":
             lines.append("⚠️ Заявка сохранена как черновик и ещё не запущена в работу")
             lines.append("➡️ Оператор должен завершить оформление заявки и перевести её в стадию «Новый»")
+            lines.append("👤 Обратитесь к оператору")
             problems += 1
+            add_unique(problem_reasons, "Заявка находится в черновике и ещё не запущена в работу")
+            add_unique(required_actions, "Завершить оформление и перевести заявку в стадию «Новый»")
+            add_unique(responsible_people, "оператор")
 
         elif status_code == "B#N":
             lines.append("⚠️ Заявка ещё не передана на финансовую проверку")
             lines.append("➡️ Оператор должен перевести заявку в стадию «В обработке»")
             lines.append("➡️ После этого заявка будет передана в финансовый отдел")
+            lines.append("👤 Обратитесь к оператору")
             problems += 1
+            add_unique(problem_reasons, "Заявка ещё не передана на финансовую проверку")
+            add_unique(required_actions, "Перевести заявку в стадию «В обработке»")
+            add_unique(responsible_people, "оператор")
 
         elif status_code == "B#E":
             lines.append("⏳ Заявка передана в финансовый отдел")
             lines.append("➡️ Выполняется проверка в системе «Плюсовой баланс»")
+            lines.append("👤 Если стадия долго не меняется — обратитесь в финансовый отдел")
 
         elif status_code in ("B#W", "B#S", "B#V"):
-            need_assembly = status_code in ("B#S", "B#V")
             region_results = [item for item in results.get("regions", []) if item.get("selected", True)]
-            matched_regions = [
-                item for item in region_results
-                if bool_value(item.get("wms", {}), "order_found", "document_found")
-            ]
-
-            if not matched_regions:
-                if any(not item.get("wms", {}).get("_error") for item in region_results):
-                    lines.append("❌ Расходный ордер не найден ни в одном WMS")
-                    lines.append("➡️ Обратитесь на склад")
-                    problems += 1
-                else:
-                    lines.append("❌ WMS проверить не удалось")
-                    unavailable += 1
-            else:
-                for item in matched_regions:
-                    lines.append("")
-                    lines.append(f"📍 Регион: {item['name']}")
-                    wms = item.get("wms", {})
-                    if wms.get("_error"):
-                        lines.append(f"❌ WMS недоступна: {describe_error(wms['_error'])}")
-                        unavailable += 1
-                    else:
-                        order_found = bool_value(wms, "order_found", "document_found")
-                        assembled = bool_value(wms, "assembly_completed", "assembled")
-                        lines.append("✅ WMS: расходный ордер найден" if order_found else "❌ WMS: расходный ордер не найден")
-                        if need_assembly and order_found:
-                            lines.append("✅ WMS: сборка завершена" if assembled else "⚠️ WMS: сборка не завершена")
-                        if not order_found or (need_assembly and not assembled):
-                            lines.append("➡️ Обратитесь на склад")
-                            problems += 1
+            if not results.get("warehouse_routing_exact", True):
+                lines.append("ℹ️ Склад не сопоставлен с настройками: выполнен поиск по WMS")
+                matched = [
+                    item for item in region_results
+                    if not item.get("wms", {}).get("_error")
+                    and bool_value(item.get("wms", {}), "document_found", "order_found")
+                ]
+                if matched:
+                    region_results = [
+                        item for item in region_results
+                        if item in matched or item.get("wms", {}).get("_error")
+                    ]
+            if not region_results:
+                lines.append("❌ WMS проверить не удалось: нет настроенных складов")
+                unavailable += 1
+                add_unique(unavailable_reasons, "Для склада не настроена WMS")
+                add_unique(required_actions, "Обратиться к администратору интеграции")
+                add_unique(responsible_people, "администратор интеграции")
+            for item in region_results:
+                lines.extend(["", f"📍 Регион: {item['name']}"])
+                details, issue_count, error_count = format_wms(
+                    item.get("wms", {}), status_code, item.get("wms_responsible", ""),
+                    item.get("series_check"),
+                )
+                lines.extend(details)
+                problems += issue_count
+                unavailable += error_count
+                reason, action, owner = wms_summary(
+                    item.get("wms", {}), status_code, item.get("series_check"),
+                    item.get("wms_responsible", ""),
+                )
+                if error_count:
+                    add_unique(unavailable_reasons, reason)
+                elif issue_count:
+                    add_unique(problem_reasons, reason)
+                if issue_count or error_count:
+                    add_unique(required_actions, action)
+                    add_unique(responsible_people, owner)
 
         elif status_code == "A":
             accounting = results.get("accounting", {})
@@ -512,6 +880,9 @@ def format_result(doc_number, results):
                 lines.append(f"❌ Бухгалтерия недоступна: {describe_error(accounting['_error'])}")
                 lines.append("➡️ Не удалось проверить отправку ЭСФ")
                 unavailable += 1
+                add_unique(unavailable_reasons, "Бухгалтерия недоступна, статус ЭСФ не проверен")
+                add_unique(required_actions, "Повторить проверку или обратиться в бухгалтерию")
+                add_unique(responsible_people, "бухгалтерия")
             else:
                 document_found = bool_value(accounting, "document_found", "order_found")
                 document_posted = bool_value(accounting, "document_posted")
@@ -520,25 +891,47 @@ def format_result(doc_number, results):
                 if document_found:
                     lines.append("✅ Документ проведён" if document_posted else "⚠️ Документ не проведён")
                 lines.append("✅ ЭСФ отправлена" if invoice_sent else "❌ ЭСФ не отправлена")
-                if invoice_sent:
+                if document_found and document_posted and invoice_sent:
                     lines.append("✅ Заявка готова: ЭСФ отправлена")
                 else:
                     lines.append("➡️ Обратитесь в бухгалтерию")
                     problems += 1
+                    if not document_found:
+                        add_unique(problem_reasons, "Документ не найден в бухгалтерии")
+                    elif not document_posted:
+                        add_unique(problem_reasons, "Документ в бухгалтерии не проведён")
+                    if not invoice_sent:
+                        add_unique(problem_reasons, "ЭСФ не отправлена")
+                    add_unique(required_actions, "Обратиться в бухгалтерию")
+                    add_unique(responsible_people, "бухгалтерия")
 
         else:
             lines.append("⚠️ Для этой стадии правило проверки ещё не настроено")
+            lines.append("👤 Обратитесь к администратору бота")
             problems += 1
+            add_unique(problem_reasons, "Для текущей стадии правило проверки не настроено")
+            add_unique(required_actions, "Обратиться к администратору бота")
+            add_unique(responsible_people, "администратор бота")
 
     elapsed = float(results.get("_elapsed", 0))
-    lines.append("")
+    lines.extend(["", "━━━━━━━━━━━━━━"])
     if cancelled and unavailable == 0:
-        lines.append("ℹ️ Проверка завершена: заявка отменена")
+        lines.append("ℹ️ ИТОГ: ЗАЯВКА ОТМЕНЕНА")
     elif problems == 0 and unavailable == 0:
-        lines.append("✅ Всё в порядке")
+        lines.append("✅ ИТОГ: ОШИБОК НЕ НАЙДЕНО")
     else:
-        lines.append(f"Проблемы заявки: {problems}")
-        lines.append(f"Недоступные системы: {unavailable}")
+        if problems > 0:
+            lines.append("❌ ИТОГ: ЕСТЬ ПРОБЛЕМА")
+        else:
+            lines.append("⚠️ ИТОГ: ПРОВЕРКА НЕ ЗАВЕРШЕНА")
+        for reason in problem_reasons:
+            lines.append(f"🔎 Причина: {reason}")
+        for reason in unavailable_reasons:
+            lines.append(f"⚠️ Не проверено: {reason}")
+        for action in required_actions:
+            lines.append(f"➡️ Что делать: {action}")
+        for owner in responsible_people:
+            lines.append(f"👤 Ответственный: {owner}")
     lines.append(f"Проверено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
     lines.append(f"Время проверки: {elapsed:.1f} сек.")
     return "\n".join(lines)
@@ -607,6 +1000,7 @@ def check_order(config, doc_number):
                 if warehouse_name and warehouse_name not in warehouse_names:
                     warehouse_names.append(warehouse_name)
 
+    results["warehouse_routing_exact"] = bool(matched_region_indexes)
     results["warehouse_names"] = warehouse_names
     results["warehouse_details"] = warehouse_details
 
@@ -627,7 +1021,7 @@ def check_order(config, doc_number):
         for index in indexes_to_check:
             region = regions[index]
             if need_wms:
-                jobs[pool.submit(request_json, region.get("wms", {}), doc_number, timeout)] = ("region", "wms", index)
+                jobs[pool.submit(request_wms, region.get("wms", {}), doc_number, timeout)] = ("region", "wms", index)
 
         for job in as_completed(jobs):
             scope, service_name, index = jobs[job]
@@ -640,6 +1034,19 @@ def check_order(config, doc_number):
                 results[service_name] = value
             else:
                 results["regions"][index][service_name] = value
+
+    if need_wms and not smartup.get("_error"):
+        for item in results["regions"]:
+            wms = item.get("wms")
+            if not isinstance(wms, dict) or wms.get("_error"):
+                continue
+            if (
+                wms.get("document_found")
+                and wms.get("assembly_found")
+                and wms.get("assembly_finished")
+                and not wms.get("basket_has_items")
+            ):
+                item["series_check"] = compare_series(smartup, wms)
 
     results["_elapsed"] = time.perf_counter() - started
     answer = format_result(doc_number, results)
@@ -665,7 +1072,7 @@ def check_health(config):
         tasks.append(("Бухгалтерия", pool.submit(request_json, config.get("accounting", {}), health_doc, timeout)))
         for region in regions:
             name = str(region.get("name", "Без названия"))
-            tasks.append((f"WMS {name}", pool.submit(request_json, region.get("wms", {}), health_doc, timeout)))
+            tasks.append((f"WMS {name}", pool.submit(request_wms, region.get("wms", {}), health_doc, timeout)))
 
         lines = ["Состояние интеграций", ""]
         failed = 0
@@ -683,8 +1090,285 @@ def check_health(config):
 
 
 def is_allowed(config, chat_id):
-    allowed = {str(item) for item in config.get("allowed_chat_ids", [])}
-    return str(chat_id) in allowed
+    configured = config.get("allowed_chat_ids", [])
+    if isinstance(configured, (str, int)):
+        configured = [configured]
+    allowed = {str(item) for item in configured}
+    approved = set(load_access_state().get("approved_chat_ids", []))
+    return str(chat_id) in allowed or str(chat_id) in approved
+
+
+def is_admin(config, user_id):
+    return str(user_id) in admin_ids(config)
+
+
+def chat_description(message):
+    chat = message.get("chat", {})
+    sender = message.get("from", {})
+    title = str(chat.get("title") or "").strip()
+    if not title:
+        title = " ".join(
+            part for part in (str(sender.get("first_name") or "").strip(), str(sender.get("last_name") or "").strip())
+            if part
+        )
+    username = str(chat.get("username") or sender.get("username") or "").strip()
+    return title or "Без названия", username
+
+
+def request_access(config, message):
+    chat_id = message.get("chat", {}).get("id")
+    user_id = message.get("from", {}).get("id", chat_id)
+    if is_allowed(config, chat_id):
+        return "✅ У этого чата уже есть доступ. Можно проверять заявки."
+
+    state = load_access_state()
+    key = str(chat_id)
+    title, username = chat_description(message)
+    if key in state["pending"]:
+        return "⏳ Заявка на доступ уже отправлена администратору."
+
+    state["pending"][key] = {
+        "chat_id": key,
+        "chat_title": title,
+        "chat_type": str(message.get("chat", {}).get("type") or ""),
+        "username": username,
+        "requester_id": str(user_id),
+        "requested_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_access_state(state)
+
+    admins = admin_ids(config)
+    if not admins:
+        logging.error("Регистрация chat_id=%s: не настроены admin_chat_ids", chat_id)
+        return (
+            "⚠️ Заявка сохранена, но администратор не настроен. "
+            "Добавьте admin_chat_ids в config.json."
+        )
+
+    username_line = f"\nUsername: @{username}" if username else ""
+    admin_text = (
+        "🔐 Запрос доступа к боту\n\n"
+        f"Чат: {title}\n"
+        f"Chat ID: {chat_id}\n"
+        f"User ID: {user_id}{username_line}"
+    )
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Разрешить", "callback_data": f"access:approve:{chat_id}"},
+            {"text": "❌ Отклонить", "callback_data": f"access:reject:{chat_id}"},
+        ]]
+    }
+    delivered = 0
+    for admin_id in admins:
+        try:
+            telegram_call(
+                config["telegram_bot_token"],
+                "sendMessage",
+                {
+                    "chat_id": admin_id,
+                    "text": admin_text,
+                    "reply_markup": json.dumps(keyboard, ensure_ascii=False),
+                },
+            )
+            delivered += 1
+        except Exception as error:
+            logging.error("Не удалось отправить запрос доступа администратору %s: %s", admin_id, error)
+
+    if delivered:
+        return "✅ Заявка на доступ отправлена администратору. Бот сообщит о решении в этом чате."
+    return "⚠️ Заявка сохранена, но уведомить администратора не удалось. Обратитесь к нему напрямую."
+
+
+def handle_callback(config, callback):
+    token = config["telegram_bot_token"]
+    callback_id = callback.get("id")
+    data = str(callback.get("data") or "")
+    admin_user_id = callback.get("from", {}).get("id")
+    message = callback.get("message", {})
+
+    def acknowledge(text, alert=False):
+        telegram_call(
+            token,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_id, "text": text, "show_alert": "true" if alert else "false"},
+        )
+
+    match = re.fullmatch(r"access:(approve|reject):(-?\d+)", data)
+    if not match:
+        acknowledge("Неизвестное действие", True)
+        return
+    if not is_admin(config, admin_user_id):
+        acknowledge("У вас нет прав администратора", True)
+        return
+
+    action, target_chat_id = match.groups()
+    state = load_access_state()
+    request_info = state["pending"].get(target_chat_id)
+    if request_info is None:
+        acknowledge("Запрос уже обработан", True)
+        return
+
+    state["pending"].pop(target_chat_id, None)
+    approved = set(state["approved_chat_ids"])
+    if action == "approve":
+        approved.add(target_chat_id)
+    state["approved_chat_ids"] = sorted(approved)
+    save_access_state(state)
+
+    decision = "✅ Доступ разрешён" if action == "approve" else "❌ Доступ отклонён"
+    acknowledge(decision)
+    callback_chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+    if callback_chat_id is not None and message_id is not None:
+        original = str(message.get("text") or "Запрос доступа")
+        try:
+            telegram_call(
+                token,
+                "editMessageText",
+                {"chat_id": callback_chat_id, "message_id": message_id, "text": f"{original}\n\n{decision}"},
+            )
+        except Exception as error:
+            logging.error("Не удалось обновить сообщение регистрации: %s", error)
+
+    if action == "approve":
+        target_text = "✅ Доступ к боту разрешён. Теперь можно проверять заявки."
+        target_keyboard = main_keyboard(True)
+    else:
+        target_text = "❌ Администратор отклонил заявку на доступ."
+        target_keyboard = main_keyboard(False)
+    try:
+        telegram_call(
+            token,
+            "sendMessage",
+            {
+                "chat_id": target_chat_id,
+                "text": target_text,
+                "reply_markup": json.dumps(target_keyboard, ensure_ascii=False),
+            },
+        )
+    except Exception as error:
+        logging.error("Не удалось сообщить решение chat_id=%s: %s", target_chat_id, error)
+
+
+def parse_document_numbers(text):
+    value = str(text or "").strip()
+    if value.startswith("/"):
+        parts = value.split(maxsplit=1)
+        command = parts[0].split("@", 1)[0].lower()
+        if command == "/check":
+            value = parts[1] if len(parts) > 1 else ""
+
+    documents = []
+    invalid = []
+    for item in re.split(r"[\s,;]+", value):
+        number = item.strip()
+        if not number:
+            continue
+        if not DOC_RE.fullmatch(number):
+            invalid.append(number)
+        elif number not in documents:
+            documents.append(number)
+    return documents, invalid
+
+
+def user_mention_html(message):
+    sender = message.get("from", {})
+    user_id = sender.get("id")
+    username = str(sender.get("username") or "").strip()
+    first_name = str(sender.get("first_name") or "").strip()
+    last_name = str(sender.get("last_name") or "").strip()
+    name = f"@{username}" if username else " ".join(part for part in (first_name, last_name) if part)
+    name = name or "Пользователь"
+    if user_id is None:
+        return html.escape(name)
+    return f'<a href="tg://user?id={user_id}">{html.escape(name)}</a>'
+
+
+def split_telegram_text(text, limit=4000):
+    chunks = []
+    current = ""
+    for line in str(text).splitlines(keepends=True):
+        if len(line) > limit:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            while len(line) > limit:
+                chunks.append(line[:limit])
+                line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current.rstrip())
+    return chunks or [""]
+
+
+def check_orders(config, document_numbers):
+    results = [None] * len(document_numbers)
+    configured_workers = int(config.get("batch_workers", 3))
+    workers = min(len(document_numbers), max(1, configured_workers))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        jobs = {pool.submit(check_order, config, number): index for index, number in enumerate(document_numbers)}
+        for job in as_completed(jobs):
+            index = jobs[job]
+            try:
+                results[index] = job.result()
+            except Exception as error:
+                logging.exception("Ошибка проверки заявки %s", document_numbers[index])
+                results[index] = (
+                    f"Заявка {document_numbers[index]}\n\n"
+                    f"❌ Проверка завершилась ошибкой: {describe_error(error)}"
+                )
+    return results
+
+
+def send_batch_check(config, message, document_numbers):
+    token = config["telegram_bot_token"]
+    chat_id = message.get("chat", {}).get("id")
+    message_id = message.get("message_id")
+    mention = user_mention_html(message)
+    count = len(document_numbers)
+    if count == 1:
+        request_word = "заявку"
+    elif 2 <= count <= 4:
+        request_word = "заявки"
+    else:
+        request_word = "заявок"
+    preview = ", ".join(html.escape(number) for number in document_numbers)
+    reply_parameters = None
+    if message_id is not None:
+        reply_parameters = json.dumps({"message_id": message_id, "allow_sending_without_reply": True})
+
+    progress_params = {
+        "chat_id": chat_id,
+        "text": f"🔎 {mention}, проверяю {count} {request_word}: {preview}",
+        "parse_mode": "HTML",
+    }
+    if reply_parameters:
+        progress_params["reply_parameters"] = reply_parameters
+    telegram_call(token, "sendMessage", progress_params)
+
+    results = check_orders(config, document_numbers)
+    for index, result in enumerate(results, start=1):
+        heading = f"Результат {index}/{count}\n\n" if count > 1 else ""
+        chunks = split_telegram_text(heading + result)
+        for chunk in chunks:
+            params = {"chat_id": chat_id, "text": chunk}
+            if reply_parameters:
+                params["reply_parameters"] = reply_parameters
+            telegram_call(token, "sendMessage", params)
+
+    finished_params = {
+        "chat_id": chat_id,
+        "text": f"✅ {mention}, проверка завершена. Проверено заявок: {count}.",
+        "parse_mode": "HTML",
+        "reply_markup": json.dumps(main_keyboard(True), ensure_ascii=False),
+    }
+    if reply_parameters:
+        finished_params["reply_parameters"] = reply_parameters
+    telegram_call(token, "sendMessage", finished_params)
 
 
 def handle_message(config, message):
@@ -696,56 +1380,109 @@ def handle_message(config, message):
     if chat_id is None:
         return
 
-    if text == "/chatid":
-        answer = f"ID этого чата: {chat_id}\nДобавьте его в allowed_chat_ids в config.json и перезапустите бота."
-    elif text == "/start":
+    reply_markup = main_keyboard(is_allowed(config, chat_id))
+    reply_parameters = None
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
+    allowed = is_allowed(config, chat_id)
+
+    if command == "/chatid" or text == BUTTON_CHAT_ID:
+        answer = f"🆔 ID этого чата: {chat_id}"
+    elif command == "/start":
         WAITING_FOR_DOC.discard(state_key)
-        answer = "Бот контроля заявок запущен.\n\nНажмите «🔍 Проверить заявку» или просто отправьте её номер."
-    elif text in ("/help", BUTTON_HELP):
+        if allowed:
+            answer = "👋 Бот контроля заявок готов.\n\nНажмите «🔍 Проверить заявку» или просто отправьте её номер."
+        else:
+            answer = "👋 Бот контроля заявок.\n\nЧтобы начать работу, нажмите «📝 Запросить доступ»."
+    elif command == "/help" or text == BUTTON_HELP:
         WAITING_FOR_DOC.discard(state_key)
         answer = help_text()
-    elif not is_allowed(config, chat_id):
-        answer = "Этот чат не имеет доступа. Выполните /chatid и добавьте ID в config.json."
-    elif text in ("/health", BUTTON_HEALTH):
+    elif command == "/register" or text == BUTTON_REGISTER:
         WAITING_FOR_DOC.discard(state_key)
+        answer = request_access(config, message)
+        allowed = is_allowed(config, chat_id)
+    elif not allowed:
+        answer = "🔒 У этого чата нет доступа. Нажмите «📝 Запросить доступ»."
+    elif command == "/health" or text == BUTTON_HEALTH:
+        WAITING_FOR_DOC.discard(state_key)
+        telegram_call(config["telegram_bot_token"], "sendChatAction", {"chat_id": chat_id, "action": "typing"})
         answer = check_health(config)
     elif text == BUTTON_CHECK:
         WAITING_FOR_DOC.add(state_key)
         answer = "Введите ID заявки из Smartup.\nНапример: 4411939"
-    elif text == BUTTON_CANCEL:
+        reply_markup = force_reply_keyboard()
+        if message.get("message_id") is not None:
+            reply_parameters = {"message_id": message["message_id"]}
+    elif command == "/cancel" or text == BUTTON_CANCEL:
         WAITING_FOR_DOC.discard(state_key)
         answer = "Проверка отменена."
     else:
-        doc_number = text[7:].strip() if text.startswith("/check ") else text
-        if not DOC_RE.fullmatch(doc_number):
+        documents, invalid = parse_document_numbers(text)
+        max_batch = max(1, int(config.get("max_batch_documents", 10)))
+        if command and command != "/check":
+            answer = "Команда не распознана. Нажмите «ℹ️ Инструкция»."
+        elif command == "/check" and not documents and not invalid:
+            WAITING_FOR_DOC.add(state_key)
+            answer = "Введите один или несколько ID заявок из Smartup."
+            reply_markup = force_reply_keyboard()
+            if message.get("message_id") is not None:
+                reply_parameters = {"message_id": message["message_id"]}
+        elif invalid or not documents:
             if state_key in WAITING_FOR_DOC:
-                answer = "Неверный номер. Отправьте только ID заявки.\nНапример: 4411939"
+                invalid_text = f"\nНекорректные значения: {', '.join(invalid[:5])}" if invalid else ""
+                answer = (
+                    "Неверный формат. Отправьте ID через пробел, запятую или с новой строки."
+                    f"\nНапример: 4411939 4411940{invalid_text}"
+                )
+                reply_markup = force_reply_keyboard()
+                if message.get("message_id") is not None:
+                    reply_parameters = {"message_id": message["message_id"]}
             else:
                 answer = "Команда не распознана. Нажмите «ℹ️ Инструкция»."
+        elif len(documents) > max_batch:
+            answer = f"⚠️ За один раз можно проверить не больше {max_batch} заявок. Получено: {len(documents)}."
+            reply_markup = force_reply_keyboard()
+            if message.get("message_id") is not None:
+                reply_parameters = {"message_id": message["message_id"]}
         else:
             WAITING_FOR_DOC.discard(state_key)
-            logging.info("Проверка заявки=%s chat_id=%s", doc_number, chat_id)
-            answer = check_order(config, doc_number)
+            logging.info("Проверка заявок=%s chat_id=%s", ",".join(documents), chat_id)
+            send_batch_check(config, message, documents)
+            return
 
-    telegram_call(
-        config["telegram_bot_token"],
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": answer,
-            "reply_markup": json.dumps(main_keyboard(), ensure_ascii=False),
-        },
-    )
+    if not reply_markup.get("force_reply"):
+        reply_markup = main_keyboard(is_allowed(config, chat_id))
+
+    params = {
+        "chat_id": chat_id,
+        "text": answer,
+        "reply_markup": json.dumps(reply_markup, ensure_ascii=False),
+    }
+    if reply_parameters is not None:
+        params["reply_parameters"] = json.dumps(reply_parameters)
+    telegram_call(config["telegram_bot_token"], "sendMessage", params)
 
 
 def setup_logging():
-    """Логи пишутся в stdout: их собирает и ротирует Docker (docker compose logs)."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stdout,
-        force=True,
+    log_dir = ROOT / "logs"
+    log_dir.mkdir(exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        log_dir / "bot.log",
+        maxBytes=2 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
     )
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(console)
+    root_logger.addHandler(file_handler)
 
 
 def main():
@@ -766,6 +1503,8 @@ def main():
                 offset = max(offset, int(update["update_id"]) + 1)
                 if "message" in update:
                     handle_message(config, update["message"])
+                elif "callback_query" in update:
+                    handle_callback(config, update["callback_query"])
         except KeyboardInterrupt:
             logging.info("Бот остановлен")
             return 0
