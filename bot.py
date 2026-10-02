@@ -3,7 +3,6 @@ import base64
 import html
 import json
 import math
-import os
 import re
 import sys
 import time
@@ -18,19 +17,23 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-# В Docker каталог состояния монтируется с хоста (ACCESS_PATH=/app/data/access.json).
-ACCESS_PATH = Path(os.environ.get("ACCESS_PATH") or ROOT / "access.json")
+ACCESS_PATH = ROOT / "access.json"
 DOC_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._/-]{1,50}$")
 CACHE = {}
 WAREHOUSE_CACHE = {"loaded_at": 0.0, "items": {}, "error": ""}
 WAITING_FOR_DOC = set()
+REGISTRATION = {}
 
 BUTTON_CHECK = "🔍 Проверить заявку"
 BUTTON_HELP = "ℹ️ Инструкция"
 BUTTON_HEALTH = "🩺 Состояние систем"
 BUTTON_CANCEL = "❌ Отмена"
-BUTTON_REGISTER = "📝 Запросить доступ"
+BUTTON_REGISTER = "📝 Регистрация"
 BUTTON_CHAT_ID = "🆔 ID чата"
+BUTTON_LANG_RU = "🇷🇺 Русский"
+BUTTON_LANG_UZ = "🇺🇿 O'zbekcha"
+BUTTON_SEND_PHONE_RU = "📱 Отправить телефон"
+BUTTON_SEND_PHONE_UZ = "📱 Telefonni yuborish"
 
 
 def main_keyboard(allowed=False):
@@ -42,7 +45,7 @@ def main_keyboard(allowed=False):
             ],
             "resize_keyboard": True,
             "is_persistent": True,
-            "input_field_placeholder": "Запросите доступ к проверке заявок",
+            "input_field_placeholder": "Пройдите регистрацию",
         }
     return {
         "keyboard": [
@@ -54,6 +57,24 @@ def main_keyboard(allowed=False):
         "input_field_placeholder": "Введите номер заявки",
     }
 
+
+def language_keyboard():
+    return {
+        "keyboard": [[{"text": BUTTON_LANG_RU}, {"text": BUTTON_LANG_UZ}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+        "input_field_placeholder": "Выберите язык / Tilni tanlang",
+    }
+
+
+def phone_keyboard(language):
+    button_text = BUTTON_SEND_PHONE_UZ if language == "uz" else BUTTON_SEND_PHONE_RU
+    return {
+        "keyboard": [[{"text": button_text, "request_contact": True}], [{"text": BUTTON_CANCEL}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+        "input_field_placeholder": "+998 XX XXX XX XX",
+    }
 
 def force_reply_keyboard():
     return {
@@ -85,23 +106,25 @@ def help_text():
 
 
 def load_access_state():
-    empty = {"approved_chat_ids": [], "pending": {}}
+    empty = {"version": 2, "users": {}}
     if not ACCESS_PATH.exists():
         return empty
     try:
         with ACCESS_PATH.open("r", encoding="utf-8") as stream:
             data = json.load(stream)
-        approved = data.get("approved_chat_ids", [])
-        pending = data.get("pending", {})
-        if not isinstance(approved, list) or not isinstance(pending, dict):
+        if not isinstance(data, dict):
             raise ValueError("неверная структура")
+
+        users = data.get("users", {})
+        if not isinstance(users, dict):
+            raise ValueError("неверная структура")
+
         return {
-            "approved_chat_ids": [str(item) for item in approved],
-            "pending": pending,
+            "version": 2,
+            "users": {str(key): value for key, value in users.items() if isinstance(value, dict)},
         }
     except Exception:
         return empty
-
 
 def save_access_state(state):
     ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -112,14 +135,218 @@ def save_access_state(state):
     temp_path.replace(ACCESS_PATH)
 
 
-def admin_ids(config):
-    configured = config.get("admin_chat_ids")
-    if configured is None:
-        configured = config.get("allowed_chat_ids", [])
-    if isinstance(configured, (str, int)):
-        configured = [configured]
-    return {str(item) for item in configured}
+def get_registered_user(user_id):
+    if user_id is None:
+        return None
+    return load_access_state().get("users", {}).get(str(user_id))
 
+
+def save_registered_user(message, registration):
+    sender = message.get("from", {})
+    user_id = sender.get("id")
+    if user_id is None:
+        raise ValueError("Telegram не передал user_id")
+
+    state = load_access_state()
+    users = state.setdefault("users", {})
+    users[str(user_id)] = {
+        "telegram_user_id": user_id,
+        "username": str(sender.get("username") or ""),
+        "telegram_first_name": str(sender.get("first_name") or ""),
+        "telegram_last_name": str(sender.get("last_name") or ""),
+        "full_name": registration["full_name"],
+        "position": registration["position"],
+        "phones": registration["phones"],
+        "language": registration["language"],
+        "registered_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_access_state(state)
+
+
+def normalize_phone(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 12 and digits.startswith("998"):
+        return "+" + digits
+    return ""
+
+
+def parse_phone_list(value):
+    parts = [part.strip() for part in re.split(r"[,;\n]+", str(value or "")) if part.strip()]
+    if not parts:
+        return [], []
+    valid = []
+    invalid = []
+    for part in parts:
+        phone = normalize_phone(part)
+        if phone:
+            if phone not in valid:
+                valid.append(phone)
+        else:
+            invalid.append(part)
+    return valid, invalid
+
+
+def valid_full_name(value):
+    normalized = " ".join(str(value or "").split())
+    parts = normalized.split(" ") if normalized else []
+    if len(parts) < 2 or len(normalized) > 120:
+        return ""
+    for part in parts:
+        check = part.replace("-", "").replace("'", "").replace("’", "")
+        if not check or not check.isalpha():
+            return ""
+    return normalized
+
+
+def valid_position(value):
+    normalized = " ".join(str(value or "").split())
+    if len(normalized) < 2 or len(normalized) > 100:
+        return ""
+    return normalized
+
+
+def start_registration(message):
+    chat = message.get("chat", {})
+    sender = message.get("from", {})
+    chat_id = chat.get("id")
+    user_id = sender.get("id")
+    if chat_id is None or user_id is None:
+        return "⚠️ Не удалось определить пользователя.", main_keyboard(False)
+    if str(chat.get("type") or "") != "private":
+        return (
+            "👤 Регистрация выполняется в личном чате с ботом.\n\n"
+            "Откройте бота в личных сообщениях и отправьте /start.",
+            main_keyboard(False),
+        )
+
+    REGISTRATION[str(user_id)] = {
+        "step": "language",
+        "chat_id": str(chat_id),
+        "language": "",
+        "full_name": "",
+        "position": "",
+        "phones": [],
+    }
+    return "🇷🇺 Выберите язык\n🇺🇿 Tilni tanlang", language_keyboard()
+
+
+def registration_active(user_id, chat_id):
+    state = REGISTRATION.get(str(user_id))
+    return bool(state and state.get("chat_id") == str(chat_id))
+
+
+def process_registration_message(message):
+    chat_id = message.get("chat", {}).get("id")
+    user_id = message.get("from", {}).get("id")
+    key = str(user_id)
+    state = REGISTRATION.get(key)
+    if not state or state.get("chat_id") != str(chat_id):
+        return None, None
+
+    text = str(message.get("text") or "").strip()
+    step = state.get("step")
+
+    if text == BUTTON_CANCEL or text.lower() == "/cancel":
+        REGISTRATION.pop(key, None)
+        return "Регистрация отменена.", main_keyboard(False)
+
+    if step == "language":
+        if text == BUTTON_LANG_RU:
+            state["language"] = "ru"
+            state["step"] = "full_name"
+            return "👤 Введите Ф.И.О", {"remove_keyboard": True}
+        if text == BUTTON_LANG_UZ:
+            state["language"] = "uz"
+            state["step"] = "full_name"
+            return "👤 F.I.Sh ni kiriting", {"remove_keyboard": True}
+        return "Выберите язык кнопкой ниже. / Quyidagi tugma orqali tilni tanlang.", language_keyboard()
+
+    language = state.get("language") or "ru"
+
+    if step == "full_name":
+        full_name = valid_full_name(text)
+        if not full_name:
+            if language == "uz":
+                return "❗ Noto'g'ri format. Ism va familiyani kiriting.\nMasalan: Ali Valiyev", {"remove_keyboard": True}
+            return "❗ Неправильный формат. Введите минимум имя и фамилию.\nНапример: Иван Иванов", {"remove_keyboard": True}
+        state["full_name"] = full_name
+        state["step"] = "position"
+        return ("💼 Lavozimingizni kiriting" if language == "uz" else "💼 Введите вашу должность"), {"remove_keyboard": True}
+
+    if step == "position":
+        position = valid_position(text)
+        if not position:
+            return (
+                "❗ Lavozimni matn bilan kiriting." if language == "uz"
+                else "❗ Введите должность текстом."
+            ), {"remove_keyboard": True}
+        state["position"] = position
+        state["step"] = "phone"
+        if language == "uz":
+            answer = (
+                "📱 Telefon raqamingizni yuboring yoki kiriting "
+                "(bir nechta bo'lsa vergul bilan ajrating).\n"
+                "Format: +998 XX XXX XX XX"
+            )
+        else:
+            answer = (
+                "📱 Отправьте или введите номер телефона "
+                "(можно несколько через запятую).\n"
+                "В таком формате: +998 XX XXX XX XX"
+            )
+        return answer, phone_keyboard(language)
+
+    if step == "phone":
+        contact = message.get("contact") or {}
+        if contact:
+            contact_user_id = contact.get("user_id")
+            if contact_user_id is not None and str(contact_user_id) != str(user_id):
+                return (
+                    "❗ O'zingizning telefon raqamingizni yuboring." if language == "uz"
+                    else "❗ Отправьте свой номер телефона."
+                ), phone_keyboard(language)
+            phone = normalize_phone(contact.get("phone_number"))
+            phones = [phone] if phone else []
+            invalid = [] if phone else [str(contact.get("phone_number") or "")]
+        else:
+            phones, invalid = parse_phone_list(text)
+
+        if invalid or not phones:
+            return (
+                "❗ Noto'g'ri telefon formati. Masalan: +998901234567" if language == "uz"
+                else "❗ Неправильный формат телефона. Например: +998901234567"
+            ), phone_keyboard(language)
+
+        state["phones"] = phones
+        try:
+            save_registered_user(message, state)
+        except Exception as error:
+            return (
+                f"⚠️ Не удалось сохранить регистрацию в access.json: {error}",
+                phone_keyboard(language),
+            )
+
+        REGISTRATION.pop(key, None)
+        if language == "uz":
+            answer = (
+                "✅ Ro'yxatdan o'tish yakunlandi.\n\n"
+                f"F.I.Sh: {state['full_name']}\n"
+                f"Lavozim: {state['position']}\n"
+                f"Telefon: {', '.join(phones)}\n\n"
+                "Endi botdan foydalanishingiz mumkin."
+            )
+        else:
+            answer = (
+                "✅ Регистрация завершена.\n\n"
+                f"Ф.И.О: {state['full_name']}\n"
+                f"Должность: {state['position']}\n"
+                f"Телефон: {', '.join(phones)}\n\n"
+                "Теперь вы можете пользоваться ботом."
+            )
+        return answer, main_keyboard(True)
+
+    REGISTRATION.pop(key, None)
+    return "Регистрация сброшена. Нажмите /start и попробуйте ещё раз.", main_keyboard(False)
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -642,20 +869,10 @@ def telegram_call(token, method, params, timeout=40):
     url = f"https://api.telegram.org/bot{token}/{method}"
     body = urlencode(params).encode("utf-8")
     request = Request(url, data=body, method="POST")
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except HTTPError as error:
-        # Telegram возвращает причину в теле ответа; без этого остаётся
-        # бесполезное "HTTP Error 400: Bad Request".
-        try:
-            payload = json.loads(error.read().decode("utf-8"))
-            description = payload.get("description") or str(error)
-        except Exception:
-            description = str(error)
-        raise RuntimeError(f"{method}: {description}") from None
+    with urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
     if not data.get("ok"):
-        raise RuntimeError(f"{method}: {data.get('description', 'Ошибка Telegram API')}")
+        raise RuntimeError(data.get("description", "Ошибка Telegram API"))
     return data.get("result")
 
 
@@ -1097,166 +1314,27 @@ def check_health(config):
     return "\n".join(lines)
 
 
-def is_allowed(config, chat_id):
-    configured = config.get("allowed_chat_ids", [])
-    if isinstance(configured, (str, int)):
-        configured = [configured]
-    allowed = {str(item) for item in configured}
-    approved = set(load_access_state().get("approved_chat_ids", []))
-    return str(chat_id) in allowed or str(chat_id) in approved
-
-
-def is_admin(config, user_id):
-    return str(user_id) in admin_ids(config)
-
-
-def chat_description(message):
-    chat = message.get("chat", {})
-    sender = message.get("from", {})
-    title = str(chat.get("title") or "").strip()
-    if not title:
-        title = " ".join(
-            part for part in (str(sender.get("first_name") or "").strip(), str(sender.get("last_name") or "").strip())
-            if part
-        )
-    username = str(chat.get("username") or sender.get("username") or "").strip()
-    return title or "Без названия", username
-
-
-def request_access(config, message):
-    chat_id = message.get("chat", {}).get("id")
-    user_id = message.get("from", {}).get("id", chat_id)
-    if is_allowed(config, chat_id):
-        return "✅ У этого чата уже есть доступ. Можно проверять заявки."
-
-    state = load_access_state()
-    key = str(chat_id)
-    title, username = chat_description(message)
-    if key in state["pending"]:
-        return "⏳ Заявка на доступ уже отправлена администратору."
-
-    state["pending"][key] = {
-        "chat_id": key,
-        "chat_title": title,
-        "chat_type": str(message.get("chat", {}).get("type") or ""),
-        "username": username,
-        "requester_id": str(user_id),
-        "requested_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    save_access_state(state)
-
-    admins = admin_ids(config)
-    if not admins:
-        return (
-            "⚠️ Заявка сохранена, но администратор не настроен. "
-            "Добавьте admin_chat_ids в config.json."
-        )
-
-    username_line = f"\nUsername: @{username}" if username else ""
-    admin_text = (
-        "🔐 Запрос доступа к боту\n\n"
-        f"Чат: {title}\n"
-        f"Chat ID: {chat_id}\n"
-        f"User ID: {user_id}{username_line}"
-    )
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Разрешить", "callback_data": f"access:approve:{chat_id}"},
-            {"text": "❌ Отклонить", "callback_data": f"access:reject:{chat_id}"},
-        ]]
-    }
-    delivered = 0
-    for admin_id in admins:
-        try:
-            telegram_call(
-                config["telegram_bot_token"],
-                "sendMessage",
-                {
-                    "chat_id": admin_id,
-                    "text": admin_text,
-                    "reply_markup": json.dumps(keyboard, ensure_ascii=False),
-                },
-            )
-            delivered += 1
-        except Exception as error:
-            print(f"Не удалось уведомить администратора {admin_id}: {error}",
-                  file=sys.stderr, flush=True)
-
-    if delivered:
-        return "✅ Заявка на доступ отправлена администратору. Бот сообщит о решении в этом чате."
-    return "⚠️ Заявка сохранена, но уведомить администратора не удалось. Обратитесь к нему напрямую."
-
+def is_allowed(config, chat_id, user_id=None):
+    if user_id is None:
+        return False
+    return str(user_id) in load_access_state().get("users", {})
 
 def handle_callback(config, callback):
-    token = config["telegram_bot_token"]
     callback_id = callback.get("id")
-    data = str(callback.get("data") or "")
-    admin_user_id = callback.get("from", {}).get("id")
-    message = callback.get("message", {})
-
-    def acknowledge(text, alert=False):
-        telegram_call(
-            token,
-            "answerCallbackQuery",
-            {"callback_query_id": callback_id, "text": text, "show_alert": "true" if alert else "false"},
-        )
-
-    match = re.fullmatch(r"access:(approve|reject):(-?\d+)", data)
-    if not match:
-        acknowledge("Неизвестное действие", True)
+    if not callback_id:
         return
-    if not is_admin(config, admin_user_id):
-        acknowledge("У вас нет прав администратора", True)
-        return
-
-    action, target_chat_id = match.groups()
-    state = load_access_state()
-    request_info = state["pending"].get(target_chat_id)
-    if request_info is None:
-        acknowledge("Запрос уже обработан", True)
-        return
-
-    state["pending"].pop(target_chat_id, None)
-    approved = set(state["approved_chat_ids"])
-    if action == "approve":
-        approved.add(target_chat_id)
-    state["approved_chat_ids"] = sorted(approved)
-    save_access_state(state)
-
-    decision = "✅ Доступ разрешён" if action == "approve" else "❌ Доступ отклонён"
-    acknowledge(decision)
-    callback_chat_id = message.get("chat", {}).get("id")
-    message_id = message.get("message_id")
-    if callback_chat_id is not None and message_id is not None:
-        original = str(message.get("text") or "Запрос доступа")
-        try:
-            telegram_call(
-                token,
-                "editMessageText",
-                {"chat_id": callback_chat_id, "message_id": message_id, "text": f"{original}\n\n{decision}"},
-            )
-        except Exception:
-            pass
-
-    if action == "approve":
-        target_text = "✅ Доступ к боту разрешён. Теперь можно проверять заявки."
-        target_keyboard = main_keyboard(True)
-    else:
-        target_text = "❌ Администратор отклонил заявку на доступ."
-        target_keyboard = main_keyboard(False)
     try:
         telegram_call(
-            token,
-            "sendMessage",
+            config["telegram_bot_token"],
+            "answerCallbackQuery",
             {
-                "chat_id": target_chat_id,
-                "text": target_text,
-                "reply_markup": json.dumps(target_keyboard, ensure_ascii=False),
+                "callback_query_id": callback_id,
+                "text": "Ручное подтверждение больше не используется. Пройдите регистрацию через /start.",
+                "show_alert": "true",
             },
         )
     except Exception:
         pass
-
 
 def parse_document_numbers(text):
     value = str(text or "").strip()
@@ -1387,41 +1465,68 @@ def handle_message(config, message):
     if chat_id is None:
         return
 
-    reply_markup = main_keyboard(is_allowed(config, chat_id))
+    reply_markup = None
     reply_parameters = None
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
-    allowed = is_allowed(config, chat_id)
+    allowed = is_allowed(config, chat_id, user_id)
 
     if command == "/chatid" or text == BUTTON_CHAT_ID:
-        answer = f"🆔 ID этого чата: {chat_id}"
+        answer = f"🆔 ID этого чата: {chat_id}\n👤 Ваш User ID: {user_id}"
+
     elif command == "/start":
         WAITING_FOR_DOC.discard(state_key)
         if allowed:
-            answer = "👋 Бот контроля заявок готов.\n\nНажмите «🔍 Проверить заявку» или просто отправьте её номер."
+            REGISTRATION.pop(str(user_id), None)
+            user = get_registered_user(user_id)
+            if user:
+                name = str(user.get("full_name") or "").strip()
+                greeting = f", {name}" if name else ""
+            else:
+                greeting = ""
+            answer = (
+                f"👋 Бот контроля заявок готов{greeting}.\n\n"
+                "Нажмите «🔍 Проверить заявку» или просто отправьте её номер."
+            )
+            reply_markup = main_keyboard(True)
         else:
-            answer = "👋 Бот контроля заявок.\n\nЧтобы начать работу, нажмите «📝 Запросить доступ»."
+            answer, reply_markup = start_registration(message)
+
+    elif command == "/register" or text == BUTTON_REGISTER:
+        WAITING_FOR_DOC.discard(state_key)
+        answer, reply_markup = start_registration(message)
+
+    elif registration_active(user_id, chat_id):
+        WAITING_FOR_DOC.discard(state_key)
+        answer, reply_markup = process_registration_message(message)
+        allowed = is_allowed(config, chat_id, user_id)
+
     elif command == "/help" or text == BUTTON_HELP:
         WAITING_FOR_DOC.discard(state_key)
         answer = help_text()
-    elif command == "/register" or text == BUTTON_REGISTER:
-        WAITING_FOR_DOC.discard(state_key)
-        answer = request_access(config, message)
-        allowed = is_allowed(config, chat_id)
+
     elif not allowed:
-        answer = "🔒 У этого чата нет доступа. Нажмите «📝 Запросить доступ»."
+        if str(chat.get("type") or "") == "private":
+            answer = "👤 Для работы с ботом нужно пройти регистрацию. Нажмите «📝 Регистрация» или отправьте /start."
+        else:
+            answer = "👤 Вы ещё не зарегистрированы. Откройте бота в личных сообщениях и отправьте /start."
+        reply_markup = main_keyboard(False)
+
     elif command == "/health" or text == BUTTON_HEALTH:
         WAITING_FOR_DOC.discard(state_key)
         telegram_call(config["telegram_bot_token"], "sendChatAction", {"chat_id": chat_id, "action": "typing"})
         answer = check_health(config)
+
     elif text == BUTTON_CHECK:
         WAITING_FOR_DOC.add(state_key)
         answer = "Введите ID заявки из Smartup.\nНапример: 4411939"
         reply_markup = force_reply_keyboard()
         if message.get("message_id") is not None:
             reply_parameters = {"message_id": message["message_id"]}
+
     elif command == "/cancel" or text == BUTTON_CANCEL:
         WAITING_FOR_DOC.discard(state_key)
         answer = "Проверка отменена."
+
     else:
         documents, invalid = parse_document_numbers(text)
         max_batch = max(1, int(config.get("max_batch_documents", 10)))
@@ -1455,8 +1560,8 @@ def handle_message(config, message):
             send_batch_check(config, message, documents)
             return
 
-    if not reply_markup.get("force_reply"):
-        reply_markup = main_keyboard(is_allowed(config, chat_id))
+    if reply_markup is None:
+        reply_markup = main_keyboard(is_allowed(config, chat_id, user_id))
 
     params = {
         "chat_id": chat_id,
@@ -1467,7 +1572,6 @@ def handle_message(config, message):
         params["reply_parameters"] = json.dumps(reply_parameters)
     telegram_call(config["telegram_bot_token"], "sendMessage", params)
 
-
 def main():
     try:
         config = load_config()
@@ -1476,40 +1580,20 @@ def main():
         return 1
 
     token = config["telegram_bot_token"]
-
-    # Webhook и getUpdates взаимно исключают друг друга: если на токене висит
-    # webhook, Telegram отвечает на getUpdates ошибкой 409 Conflict и бот не
-    # получает ни одного обновления. Снимаем его перед началом опроса.
-    try:
-        telegram_call(token, "deleteWebhook", {"drop_pending_updates": "false"})
-    except Exception as error:
-        print(f"Не удалось снять webhook: {error}", file=sys.stderr, flush=True)
-
-    print("Бот запущен", flush=True)
     offset = 0
-    failures = 0
     while True:
         try:
             updates = telegram_call(token, "getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
-            failures = 0
             for update in updates:
                 offset = max(offset, int(update["update_id"]) + 1)
-                try:
-                    if "message" in update:
-                        handle_message(config, update["message"])
-                    elif "callback_query" in update:
-                        handle_callback(config, update["callback_query"])
-                except Exception as error:
-                    # Сбой на одном обновлении не должен останавливать опрос.
-                    print(f"Ошибка обработки обновления {update.get('update_id')}: {error}",
-                          file=sys.stderr, flush=True)
+                if "message" in update:
+                    handle_message(config, update["message"])
+                elif "callback_query" in update:
+                    handle_callback(config, update["callback_query"])
         except KeyboardInterrupt:
-            print("Бот остановлен", flush=True)
             return 0
-        except Exception as error:
-            failures += 1
-            print(f"Ошибка опроса Telegram: {error}", file=sys.stderr, flush=True)
-            time.sleep(min(3 * failures, 30))
+        except Exception:
+            time.sleep(3)
 
 
 if __name__ == "__main__":
