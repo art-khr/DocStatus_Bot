@@ -4,8 +4,14 @@ services:
     image: docstatus-bot:latest
     container_name: docstatus-bot
     restart: unless-stopped
+    # Бот перезаписывает data/access.json, поэтому работает от UID/GID владельца
+    # каталога на хосте (см. .env).
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./config.json:/app/config.json:ro
+      # Каталог, а не файл: бот пишет access.json через атомарный rename,
+      # который невозможен при монтировании одиночного файла.
+      - ./data:/app/data
     environment:
       - TZ=Asia/Tashkent
     deploy:

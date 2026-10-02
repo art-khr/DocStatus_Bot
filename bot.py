@@ -3,6 +3,7 @@ import base64
 import html
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -17,7 +18,8 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
-ACCESS_PATH = ROOT / "access.json"
+# В Docker каталог состояния монтируется с хоста (ACCESS_PATH=/app/data/access.json).
+ACCESS_PATH = Path(os.environ.get("ACCESS_PATH") or ROOT / "access.json")
 DOC_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._/-]{1,50}$")
 CACHE = {}
 WAREHOUSE_CACHE = {"loaded_at": 0.0, "items": {}, "error": ""}
@@ -102,6 +104,7 @@ def load_access_state():
 
 
 def save_access_state(state):
+    ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
     temp_path = ACCESS_PATH.with_suffix(".json.tmp")
     with temp_path.open("w", encoding="utf-8") as stream:
         json.dump(state, stream, ensure_ascii=False, indent=2)

@@ -1,5 +1,9 @@
 config.json
+access.json
+.env
+
+# Состояние доступа — локальное для каждой машины
+data/
 
 __pycache__/
 *.pyc
-access.json
