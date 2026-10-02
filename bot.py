@@ -642,10 +642,20 @@ def telegram_call(token, method, params, timeout=40):
     url = f"https://api.telegram.org/bot{token}/{method}"
     body = urlencode(params).encode("utf-8")
     request = Request(url, data=body, method="POST")
-    with urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        # Telegram возвращает причину в теле ответа; без этого остаётся
+        # бесполезное "HTTP Error 400: Bad Request".
+        try:
+            payload = json.loads(error.read().decode("utf-8"))
+            description = payload.get("description") or str(error)
+        except Exception:
+            description = str(error)
+        raise RuntimeError(f"{method}: {description}") from None
     if not data.get("ok"):
-        raise RuntimeError(data.get("description", "Ошибка Telegram API"))
+        raise RuntimeError(f"{method}: {data.get('description', 'Ошибка Telegram API')}")
     return data.get("result")
 
 
@@ -1168,8 +1178,9 @@ def request_access(config, message):
                 },
             )
             delivered += 1
-        except Exception:
-            pass
+        except Exception as error:
+            print(f"Не удалось уведомить администратора {admin_id}: {error}",
+                  file=sys.stderr, flush=True)
 
     if delivered:
         return "✅ Заявка на доступ отправлена администратору. Бот сообщит о решении в этом чате."
@@ -1465,20 +1476,40 @@ def main():
         return 1
 
     token = config["telegram_bot_token"]
+
+    # Webhook и getUpdates взаимно исключают друг друга: если на токене висит
+    # webhook, Telegram отвечает на getUpdates ошибкой 409 Conflict и бот не
+    # получает ни одного обновления. Снимаем его перед началом опроса.
+    try:
+        telegram_call(token, "deleteWebhook", {"drop_pending_updates": "false"})
+    except Exception as error:
+        print(f"Не удалось снять webhook: {error}", file=sys.stderr, flush=True)
+
+    print("Бот запущен", flush=True)
     offset = 0
+    failures = 0
     while True:
         try:
             updates = telegram_call(token, "getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
+            failures = 0
             for update in updates:
                 offset = max(offset, int(update["update_id"]) + 1)
-                if "message" in update:
-                    handle_message(config, update["message"])
-                elif "callback_query" in update:
-                    handle_callback(config, update["callback_query"])
+                try:
+                    if "message" in update:
+                        handle_message(config, update["message"])
+                    elif "callback_query" in update:
+                        handle_callback(config, update["callback_query"])
+                except Exception as error:
+                    # Сбой на одном обновлении не должен останавливать опрос.
+                    print(f"Ошибка обработки обновления {update.get('update_id')}: {error}",
+                          file=sys.stderr, flush=True)
         except KeyboardInterrupt:
+            print("Бот остановлен", flush=True)
             return 0
-        except Exception:
-            time.sleep(3)
+        except Exception as error:
+            failures += 1
+            print(f"Ошибка опроса Telegram: {error}", file=sys.stderr, flush=True)
+            time.sleep(min(3 * failures, 30))
 
 
 if __name__ == "__main__":
