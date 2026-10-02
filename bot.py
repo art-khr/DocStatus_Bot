@@ -2,14 +2,12 @@
 import base64
 import html
 import json
-import logging
 import math
 import re
 import sys
 import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -99,8 +97,7 @@ def load_access_state():
             "approved_chat_ids": [str(item) for item in approved],
             "pending": pending,
         }
-    except Exception as error:
-        logging.error("Не удалось прочитать access.json: %s", error)
+    except Exception:
         return empty
 
 
@@ -163,7 +160,6 @@ def request_json(service, doc_number, timeout):
             error_body = error.read().decode("utf-8", errors="replace").strip()
         except Exception:
             error_body = ""
-        logging.error("HTTP %s; URL=%s; body=%s", error.code, url, error_body[:3000])
         return {"_error": f"HTTP {error.code}", "_technical": error_body[:3000]}
     except URLError as error:
         return {"_error": f"нет соединения: {error.reason}"}
@@ -180,7 +176,6 @@ def request_json(service, doc_number, timeout):
             return {"_error": str(data["error"])}
         return data
     except json.JSONDecodeError:
-        logging.error("Получен не JSON; URL=%s; body=%s", url, body[:3000])
         return {"_error": "база вернула не JSON"}
 
 
@@ -1139,7 +1134,6 @@ def request_access(config, message):
 
     admins = admin_ids(config)
     if not admins:
-        logging.error("Регистрация chat_id=%s: не настроены admin_chat_ids", chat_id)
         return (
             "⚠️ Заявка сохранена, но администратор не настроен. "
             "Добавьте admin_chat_ids в config.json."
@@ -1171,8 +1165,8 @@ def request_access(config, message):
                 },
             )
             delivered += 1
-        except Exception as error:
-            logging.error("Не удалось отправить запрос доступа администратору %s: %s", admin_id, error)
+        except Exception:
+            pass
 
     if delivered:
         return "✅ Заявка на доступ отправлена администратору. Бот сообщит о решении в этом чате."
@@ -1227,8 +1221,8 @@ def handle_callback(config, callback):
                 "editMessageText",
                 {"chat_id": callback_chat_id, "message_id": message_id, "text": f"{original}\n\n{decision}"},
             )
-        except Exception as error:
-            logging.error("Не удалось обновить сообщение регистрации: %s", error)
+        except Exception:
+            pass
 
     if action == "approve":
         target_text = "✅ Доступ к боту разрешён. Теперь можно проверять заявки."
@@ -1246,8 +1240,8 @@ def handle_callback(config, callback):
                 "reply_markup": json.dumps(target_keyboard, ensure_ascii=False),
             },
         )
-    except Exception as error:
-        logging.error("Не удалось сообщить решение chat_id=%s: %s", target_chat_id, error)
+    except Exception:
+        pass
 
 
 def parse_document_numbers(text):
@@ -1316,7 +1310,6 @@ def check_orders(config, document_numbers):
             try:
                 results[index] = job.result()
             except Exception as error:
-                logging.exception("Ошибка проверки заявки %s", document_numbers[index])
                 results[index] = (
                     f"Заявка {document_numbers[index]}\n\n"
                     f"❌ Проверка завершилась ошибкой: {describe_error(error)}"
@@ -1445,7 +1438,6 @@ def handle_message(config, message):
                 reply_parameters = {"message_id": message["message_id"]}
         else:
             WAITING_FOR_DOC.discard(state_key)
-            logging.info("Проверка заявок=%s chat_id=%s", ",".join(documents), chat_id)
             send_batch_check(config, message, documents)
             return
 
@@ -1462,31 +1454,7 @@ def handle_message(config, message):
     telegram_call(config["telegram_bot_token"], "sendMessage", params)
 
 
-def setup_logging():
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-
-    file_handler = RotatingFileHandler(
-        log_dir / "bot.log",
-        maxBytes=2 * 1024 * 1024,
-        backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()
-    root_logger.addHandler(console)
-    root_logger.addHandler(file_handler)
-
-
 def main():
-    setup_logging()
     try:
         config = load_config()
     except Exception as error:
@@ -1495,7 +1463,6 @@ def main():
 
     token = config["telegram_bot_token"]
     offset = 0
-    logging.info("Бот запущен")
     while True:
         try:
             updates = telegram_call(token, "getUpdates", {"offset": offset, "timeout": 30}, timeout=40)
@@ -1506,10 +1473,8 @@ def main():
                 elif "callback_query" in update:
                     handle_callback(config, update["callback_query"])
         except KeyboardInterrupt:
-            logging.info("Бот остановлен")
             return 0
-        except Exception as error:
-            logging.error("Ошибка цикла: %s", error)
+        except Exception:
             time.sleep(3)
 
 
