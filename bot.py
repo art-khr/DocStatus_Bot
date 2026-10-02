@@ -390,6 +390,14 @@ def request_json(service, doc_number, timeout):
             error_body = error.read().decode("utf-8", errors="replace").strip()
         except Exception:
             error_body = ""
+        if error_body:
+            try:
+                error_data = json.loads(error_body)
+                service_error = error_data.get("error") if isinstance(error_data, dict) else ""
+                if service_error:
+                    return {"_error": f"HTTP {error.code}: {service_error}"}
+            except json.JSONDecodeError:
+                pass
         return {"_error": f"HTTP {error.code}", "_technical": error_body[:3000]}
     except URLError as error:
         return {"_error": f"нет соединения: {error.reason}"}
@@ -457,6 +465,13 @@ def normalize_wms(data):
         result["series_data_error"] = "WMS вернула некорректные строки assembly_items"
         assembly_items = []
     result["assembly_items"] = assembly_items
+
+    for field in ("unassembled_items", "basket_items"):
+        items = data.get(field, [])
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            return {"_error": f"WMS вернула неверный формат {field}"}
+        result[field] = items
+
     # Keep supported aliases consistent with the calculated result.
     result["order_found"] = result["document_found"]
     result["assembly_completed"] = result["assembled"]
@@ -483,6 +498,31 @@ def display_quantity(value):
     if number == number.to_integral_value():
         return str(int(number))
     return format(number.normalize(), "f")
+
+
+def item_label(item):
+    name = str(item.get("product_name") or "").strip()
+    code = str(item.get("product_code") or "").strip()
+    if name and code:
+        return f"{name} ({code})"
+    return name or code or "Товар без наименования"
+
+
+def format_wms_items(items, quantity_field, limit=10):
+    lines = []
+    for item in items[:limit]:
+        product = item_label(item)
+        series = str(item.get("series") or "").strip()
+        try:
+            quantity = display_quantity(decimal_value(item.get(quantity_field)))
+        except (InvalidOperation, ValueError):
+            quantity = str(item.get(quantity_field) or "не указано").strip()
+        series_text = f", серия {series}" if series else ""
+        lines.append(f"   • {product}{series_text} — {quantity}")
+    extra = len(items) - limit
+    if extra > 0:
+        lines.append(f"   • Ещё товаров: {extra}")
+    return lines
 
 
 def compare_series(smartup, wms):
@@ -588,12 +628,17 @@ def format_wms(wms, status_code, responsible="", series_check=None):
     else:
         lines.append("✅ WMS: расходный ордер найден")
         if not wms["assembly_found"]:
-            lines.append("⚠️ БЯС не найдена")
+            lines.append("⚠️ Сборка не начата: БЯС не выбрана")
             action = "Обратитесь на склад"
             problems = 1
             warehouse_contact = True
         elif not wms["assembly_finished"]:
             lines.extend(["✅ БЯС найдена", "⚠️ Сборка товара не завершена"])
+            unassembled_items = wms.get("unassembled_items", [])
+            if unassembled_items:
+                lines.append(f"📦 Несобранных позиций: {len(unassembled_items)} — таблица ниже")
+            else:
+                lines.append("⚠️ WMS не вернула список несобранных товаров")
             action = "Обратитесь на склад"
             problems = 1
             warehouse_contact = True
@@ -642,6 +687,11 @@ def format_wms(wms, status_code, responsible="", series_check=None):
     quantity = wms["basket_quantity"]
     if quantity > 0:
         lines.append(f"❌ В корзине осталось товара: {quantity:,}".replace(",", " ").removesuffix(".0"))
+        basket_items = wms.get("basket_items", [])
+        if basket_items:
+            lines.append(f"🧺 Позиций в корзине: {len(basket_items)} — таблица ниже")
+        else:
+            lines.append("⚠️ WMS не вернула состав корзины")
     return lines, problems, 0
 
 
@@ -876,6 +926,103 @@ def telegram_call(token, method, params, timeout=40):
     return data.get("result")
 
 
+def table_cell(text, header=False, align="left"):
+    cell = {
+        "text": str(text if text not in (None, "") else "—"),
+        "align": align,
+        "valign": "middle",
+    }
+    if header:
+        cell["is_header"] = True
+    return cell
+
+
+def build_items_rich_message(title, items, quantity_field, quantity_title):
+    cells = [[
+        table_cell("Наименование", True),
+        table_cell("Код", True, "center"),
+        table_cell("Серия", True, "center"),
+        table_cell(quantity_title, True, "center"),
+    ]]
+
+    for item in items:
+        try:
+            quantity = display_quantity(decimal_value(item.get(quantity_field)))
+        except (InvalidOperation, ValueError):
+            quantity = str(item.get(quantity_field) or "—").strip()
+        cells.append([
+            table_cell(item.get("product_name") or "Товар без наименования"),
+            table_cell(item.get("product_code"), align="center"),
+            table_cell(item.get("series"), align="center"),
+            table_cell(quantity, align="right"),
+        ])
+
+    return {
+        "blocks": [
+            {"type": "heading", "text": title, "size": 4},
+            {
+                "type": "table",
+                "cells": cells,
+                "is_bordered": True,
+                "is_striped": True,
+                "is_compact": True,
+            },
+        ],
+        "skip_entity_detection": True,
+    }
+
+
+def collect_wms_tables(results):
+    tables = []
+    for region in results.get("regions", []):
+        if not region.get("selected", True):
+            continue
+        wms = normalize_wms(region.get("wms", {}))
+        if wms.get("_error") or not wms.get("document_found"):
+            continue
+        region_name = str(region.get("name") or "").strip()
+        suffix = f" — {region_name}" if region_name else ""
+        unassembled = wms.get("unassembled_items", [])
+        basket = wms.get("basket_items", [])
+        if unassembled:
+            tables.append({
+                "title": f"📦 Не собрано{suffix}",
+                "items": unassembled,
+                "quantity_field": "remaining_quantity",
+                "quantity_title": "Не собрано",
+            })
+        if basket:
+            tables.append({
+                "title": f"🧺 Товары в корзине{suffix}",
+                "items": basket,
+                "quantity_field": "basket_quantity",
+                "quantity_title": "В корзине",
+            })
+    return tables
+
+
+def send_items_table(token, chat_id, table, reply_parameters=None):
+    rich_message = build_items_rich_message(
+        table["title"], table["items"], table["quantity_field"], table["quantity_title"]
+    )
+    params = {
+        "chat_id": chat_id,
+        "rich_message": json.dumps(rich_message, ensure_ascii=False),
+    }
+    if reply_parameters:
+        params["reply_parameters"] = reply_parameters
+    try:
+        telegram_call(token, "sendRichMessage", params)
+        return
+    except Exception:
+        lines = [table["title"] + ":"]
+        lines.extend(format_wms_items(table["items"], table["quantity_field"], limit=20))
+        fallback = {"chat_id": chat_id, "text": "\n".join(lines)}
+        if reply_parameters:
+            fallback["reply_parameters"] = reply_parameters
+        telegram_call(token, "sendMessage", fallback)
+
+
 def bool_value(data, *names):
     for name in names:
         if name in data:
@@ -964,9 +1111,11 @@ def wms_summary(wms, status_code, series_check=None, responsible=""):
     if not normalized["document_found"]:
         return "Расходный ордер не найден в WMS", "Обратиться на склад", owner
     if not normalized["assembly_found"]:
-        return "БЯС по заявке не найдена", "Обратиться на склад", owner
+        return "Сборка не начата: БЯС не выбрана", "Склад должен выбрать БЯС и начать сборку", owner
     if not normalized["assembly_finished"]:
-        return "Сборка товара не завершена", "Склад должен завершить сборку", owner
+        count = len(normalized.get("unassembled_items", []))
+        reason = f"Сборка не завершена: несобранных позиций — {count}" if count else "Сборка товара не завершена"
+        return reason, "Склад должен собрать оставшиеся товары", owner
     if normalized["basket_has_items"]:
         quantity = normalized.get("basket_quantity", 0)
         return f"В корзине осталось товара: {quantity:g}", "Склад должен убрать товар из корзины", owner
@@ -1166,7 +1315,11 @@ def check_order(config, doc_number):
     cache_seconds = int(config.get("cache_seconds", 30))
     cached = CACHE.get(doc_number)
     if cached and time.time() - cached[0] < cache_seconds:
-        return cached[1] + "\n♻️ Результат взят из кеша"
+        cached_result = cached[1]
+        return {
+            "text": cached_result["text"] + "\n♻️ Результат взят из кеша",
+            "tables": cached_result.get("tables", []),
+        }
 
     started = time.perf_counter()
     timeout = int(config.get("request_timeout_seconds", 20))
@@ -1275,8 +1428,9 @@ def check_order(config, doc_number):
 
     results["_elapsed"] = time.perf_counter() - started
     answer = format_result(doc_number, results)
-    CACHE[doc_number] = (time.time(), answer)
-    return answer
+    result = {"text": answer, "tables": collect_wms_tables(results)}
+    CACHE[doc_number] = (time.time(), result)
+    return result
 
 
 def health_status(name, result):
@@ -1402,10 +1556,13 @@ def check_orders(config, document_numbers):
             try:
                 results[index] = job.result()
             except Exception as error:
-                results[index] = (
-                    f"Заявка {document_numbers[index]}\n\n"
-                    f"❌ Проверка завершилась ошибкой: {describe_error(error)}"
-                )
+                results[index] = {
+                    "text": (
+                        f"Заявка {document_numbers[index]}\n\n"
+                        f"❌ Проверка завершилась ошибкой: {describe_error(error)}"
+                    ),
+                    "tables": [],
+                }
     return results
 
 
@@ -1438,12 +1595,14 @@ def send_batch_check(config, message, document_numbers):
     results = check_orders(config, document_numbers)
     for index, result in enumerate(results, start=1):
         heading = f"Результат {index}/{count}\n\n" if count > 1 else ""
-        chunks = split_telegram_text(heading + result)
+        chunks = split_telegram_text(heading + result["text"])
         for chunk in chunks:
             params = {"chat_id": chat_id, "text": chunk}
             if reply_parameters:
                 params["reply_parameters"] = reply_parameters
             telegram_call(token, "sendMessage", params)
+        for table in result.get("tables", []):
+            send_items_table(token, chat_id, table, reply_parameters)
 
     finished_params = {
         "chat_id": chat_id,
