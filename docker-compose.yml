@@ -1,11 +1,37 @@
 services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: docstatus-postgres
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Tashkent
+      - POSTGRES_DB=${POSTGRES_DB:-docstatus}
+      - POSTGRES_USER=${POSTGRES_USER:-docstatus}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Задайте POSTGRES_PASSWORD в .env}
+    volumes:
+      # Именованный том: данные переживают пересоздание контейнера.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   docstatus-bot:
     build: .
     image: docstatus-bot:latest
     container_name: docstatus-bot
     restart: unless-stopped
-    # Бот перезаписывает data/access.json, поэтому работает от UID/GID владельца
-    # каталога на хосте (см. .env).
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # При APP_ENV=development бот перезаписывает data/access.json, поэтому
+    # работает от UID/GID владельца каталога на хосте (см. .env).
     user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./config.json:/app/config.json:ro
@@ -14,6 +40,12 @@ services:
       - ./data:/app/data
     environment:
       - TZ=Asia/Tashkent
+      - APP_ENV=${APP_ENV:-development}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-docstatus}
+      - POSTGRES_USER=${POSTGRES_USER:-docstatus}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     deploy:
       resources:
         limits:
@@ -27,3 +59,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  postgres-data:

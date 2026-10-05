@@ -6,10 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Бот использует только стандартную библиотеку Python — зависимости не нужны.
+# Единственная зависимость — драйвер PostgreSQL (нужен только при APP_ENV=production).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY bot.py .
 
-# Каталог состояния: сюда бот пишет access.json (монтируется с хоста).
+# Каталог состояния: при APP_ENV=development сюда пишется access.json (монтируется с хоста).
 RUN mkdir -p /app/data
 
 CMD ["python", "bot.py"]

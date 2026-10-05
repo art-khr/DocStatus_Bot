@@ -4,7 +4,6 @@
 data
 access.json
 README.md
-requirements.txt
 start_bot.bat
 Dockerfile
 .dockerignore

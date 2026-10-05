@@ -51,9 +51,25 @@ TMS:
 
 Самый простой вариант — постоянно включённый Windows-компьютер или сервер внутри сети компании. Домен, IIS, внешний IP и входящий порт не требуются. Если базы доступны только из разных изолированных сетей, между ними понадобится VPN или правила маршрутизации/firewall.
 
+## Режимы работы: development и production
+
+Режим задаётся переменной `APP_ENV` в `.env` (шаблон — `.env.example`):
+
+| `APP_ENV` | Где хранятся зарегистрированные пользователи |
+|---|---|
+| `development` (по умолчанию) | файл `access.json` (путь можно сменить переменной `ACCESS_PATH`) |
+| `production` | таблица `users` в PostgreSQL |
+
+Бот сам читает `.env` при запуске (`python bot.py`), а в Docker переменные
+передаёт `docker-compose.yml`. Таблица `users` создаётся автоматически при
+первом запуске. При старте бот пишет в лог, какое хранилище используется.
+
+В режиме `development` без Docker никаких библиотек ставить не нужно.
+Драйвер PostgreSQL (`psycopg`) нужен только в `production` и уже установлен в образе.
+
 ## Запуск в Docker
 
-Бот использует только стандартную библиотеку Python, поэтому образ получается маленьким (~79 МБ) и потребляет около 17 МБ RAM.
+`docker-compose.yml` поднимает два контейнера: бот и PostgreSQL 18.
 
 1. Скопируйте `config.sample.json` в `config.json` и заполните реальными данными:
 
@@ -61,16 +77,14 @@ TMS:
 cp config.sample.json config.json
 ```
 
-2. Подготовьте каталог состояния. Бот сам перезаписывает `access.json`
-   (заявки на доступ и одобренные чаты), поэтому файл хранится в `data/`
-   и монтируется с хоста — иначе одобренные доступы терялись бы при
-   каждом пересоздании контейнера:
+2. Создайте `.env` из шаблона, укажите режим и задайте пароль базы:
 
 ```bash
+cp .env.example .env
+sed -i "s/^UID=.*/UID=$(id -u)/; s/^GID=.*/GID=$(id -g)/" .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 24)/" .env
+sed -i "s/^APP_ENV=.*/APP_ENV=production/" .env   # на сервере
 mkdir -p data
-cp access.json data/ 2>/dev/null || true   # если файл уже есть
-printf 'UID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" > .env
-chown -R "$(id -u):$(id -g)" data
 ```
 
 3. Соберите и запустите:
@@ -79,31 +93,52 @@ chown -R "$(id -u):$(id -g)" data
 docker compose up -d --build
 ```
 
+Бот стартует только после того, как PostgreSQL пройдёт healthcheck.
+
 4. Полезные команды:
 
 ```bash
-docker compose logs -f        # смотреть логи
-docker compose restart        # перезапустить (например, после правки config.json)
-docker compose down           # остановить и удалить контейнер
-docker compose up -d --build  # применить изменения кода
+docker compose logs -f docstatus-bot   # смотреть логи бота
+docker compose restart docstatus-bot   # перезапустить (например, после правки config.json)
+docker compose down                    # остановить и удалить контейнеры (данные базы сохраняются)
+docker compose up -d --build           # применить изменения кода
 ```
 
-### Состояние доступа
+### PostgreSQL
 
-`data/access.json` — изменяемое состояние бота (кого он пропускает). Каталог
-смонтирован с хоста, поэтому выживает при пересборке и перезапуске контейнера.
-В репозиторий не попадает: `access.json` и `data/` в `.gitignore`.
+Данные базы лежат в именованном томе `postgres-data` и переживают
+`docker compose down` и пересборку. Удаляет их только `docker compose down -v`.
 
-Монтируется именно **каталог**, а не одиночный файл: бот сохраняет состояние
+Порт базы наружу не открыт — к ней подключается только бот по внутренней сети
+Docker. Посмотреть пользователей:
+
+```bash
+docker compose exec postgres psql -U docstatus -d docstatus -c "SELECT * FROM users"
+```
+
+Резервная копия и восстановление:
+
+```bash
+docker compose exec -T postgres pg_dump -U docstatus docstatus > backup.sql
+docker compose exec -T postgres psql -U docstatus -d docstatus < backup.sql
+```
+
+Вместо `POSTGRES_*` можно задать строку подключения `DATABASE_URL`
+(например, для внешнего сервера PostgreSQL).
+
+### Режим development в Docker
+
+При `APP_ENV=development` пользователи хранятся в `data/access.json`.
+Каталог смонтирован с хоста, поэтому файл выживает при пересборке контейнера
+и не попадает в репозиторий (`access.json` и `data/` в `.gitignore`).
+
+Монтируется именно **каталог**, а не одиночный файл: бот сохраняет файл
 через атомарный `rename`, а при монтировании файла это даёт ошибку
 `Errno 16 Resource busy`.
 
 Контейнер работает от UID/GID из `.env`, чтобы иметь право записи в `data/`.
 При ошибке `Permission denied` для `data/access.json` выполните
 `chown -R "$(id -u):$(id -g)" data` и перезапустите контейнер.
-
-Путь можно переопределить переменной `ACCESS_PATH` (по умолчанию в Docker —
-`/app/data/access.json`, при запуске без Docker — `access.json` рядом с `bot.py`).
 
 ### Логи
 
@@ -117,13 +152,13 @@ docker compose logs --since 1h          # за последний час
 
 Ротация настроена в `docker-compose.yml` (`max-size: 10m`, `max-file: 3`) — логи не разрастутся на диске. При необходимости их можно перенаправить в systemd/journald или во внешний сборщик (Loki, ELK), сменив `driver` в секции `logging`.
 
-`config.json` монтируется в контейнер только для чтения. После его изменения достаточно `docker compose restart`.
+`config.json` монтируется в контейнер только для чтения. После его изменения достаточно `docker compose restart docstatus-bot`.
 
-Ограничения ресурсов заданы в `docker-compose.yml`: 0.5 CPU и 128 МБ RAM. Контейнер запускается от непривилегированного пользователя `nobody` и поднимается автоматически после перезагрузки сервера (`restart: unless-stopped`).
+Ограничения ресурсов бота заданы в `docker-compose.yml`: 0.5 CPU и 128 МБ RAM. Контейнер бота запускается от непривилегированного пользователя (UID/GID из `.env`), оба контейнера поднимаются автоматически после перезагрузки сервера (`restart: unless-stopped`).
 
 ## Безопасность
 
-- Не отправляйте `config.json` другим людям и не публикуйте его в GitHub.
+- Не отправляйте `config.json` и `.env` другим людям и не публикуйте их в GitHub.
 - Для HTTP-сервисов 1С создайте отдельного пользователя только с правом чтения необходимых данных.
 - Если запросы выходят через интернет, используйте HTTPS. Basic Auth по обычному HTTP не защищает пароль.
 - Ограничьте доступ через `allowed_chat_ids`.

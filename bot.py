@@ -3,6 +3,7 @@ import base64
 import html
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -16,8 +17,26 @@ from urllib.request import Request, urlopen
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def load_env_file(path):
+    """Читает KEY=VALUE из .env. Уже заданные переменные окружения не перезаписываются."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+load_env_file(ROOT / ".env")
+
 CONFIG_PATH = ROOT / "config.json"
-ACCESS_PATH = ROOT / "access.json"
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
+ACCESS_PATH = Path(os.environ.get("ACCESS_PATH") or ROOT / "access.json")
+USER_STORE = None
 DOC_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё._/-]{1,50}$")
 CACHE = {}
 WAREHOUSE_CACHE = {"loaded_at": 0.0, "items": {}, "error": ""}
@@ -105,40 +124,150 @@ def help_text():
     )
 
 
-def load_access_state():
-    empty = {"version": 2, "users": {}}
-    if not ACCESS_PATH.exists():
-        return empty
-    try:
-        with ACCESS_PATH.open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
-        if not isinstance(data, dict):
-            raise ValueError("неверная структура")
+class JsonUserStore:
+    """Хранилище пользователей для разработки: access.json."""
 
-        users = data.get("users", {})
-        if not isinstance(users, dict):
-            raise ValueError("неверная структура")
+    def __init__(self, path):
+        self.path = path
 
-        return {
-            "version": 2,
-            "users": {str(key): value for key, value in users.items() if isinstance(value, dict)},
+    def describe(self):
+        return f"JSON-файл {self.path}"
+
+    def _load(self):
+        empty = {"version": 2, "users": {}}
+        if not self.path.exists():
+            return empty
+        try:
+            with self.path.open("r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            if not isinstance(data, dict):
+                raise ValueError("неверная структура")
+
+            users = data.get("users", {})
+            if not isinstance(users, dict):
+                raise ValueError("неверная структура")
+
+            return {
+                "version": 2,
+                "users": {str(key): value for key, value in users.items() if isinstance(value, dict)},
+            }
+        except Exception:
+            return empty
+
+    def get_user(self, user_id):
+        return self._load()["users"].get(str(user_id))
+
+    def save_user(self, user):
+        state = self._load()
+        record = dict(user)
+        record["registered_at"] = record["registered_at"].isoformat(timespec="seconds")
+        state["users"][str(user["telegram_user_id"])] = record
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_suffix(".json.tmp")
+        with temp_path.open("w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        temp_path.replace(self.path)
+
+
+class PostgresUserStore:
+    """Хранилище пользователей для production: PostgreSQL."""
+
+    COLUMNS = (
+        "telegram_user_id", "username", "telegram_first_name", "telegram_last_name",
+        "full_name", "position", "phones", "language", "registered_at",
+    )
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_user_id    BIGINT PRIMARY KEY,
+            username            TEXT NOT NULL DEFAULT '',
+            telegram_first_name TEXT NOT NULL DEFAULT '',
+            telegram_last_name  TEXT NOT NULL DEFAULT '',
+            full_name           TEXT NOT NULL,
+            position            TEXT NOT NULL,
+            phones              TEXT[] NOT NULL,
+            language            TEXT NOT NULL,
+            registered_at       TIMESTAMP NOT NULL
+        )
+    """
+
+    def __init__(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self.psycopg = psycopg
+        self.row_factory = dict_row
+        self.conninfo = os.environ.get("DATABASE_URL", "")
+        self.params = {} if self.conninfo else {
+            "host": os.environ.get("POSTGRES_HOST", "localhost"),
+            "port": os.environ.get("POSTGRES_PORT", "5432"),
+            "dbname": os.environ.get("POSTGRES_DB", "docstatus"),
+            "user": os.environ.get("POSTGRES_USER", "docstatus"),
+            "password": os.environ.get("POSTGRES_PASSWORD", ""),
         }
-    except Exception:
-        return empty
+        self.conn = None
+        self._execute(self.SCHEMA)
 
-def save_access_state(state):
-    ACCESS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = ACCESS_PATH.with_suffix(".json.tmp")
-    with temp_path.open("w", encoding="utf-8") as stream:
-        json.dump(state, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
-    temp_path.replace(ACCESS_PATH)
+    def describe(self):
+        if self.conninfo:
+            return "PostgreSQL (DATABASE_URL)"
+        return f"PostgreSQL {self.params['host']}:{self.params['port']}/{self.params['dbname']}"
+
+    def _execute(self, query, params=None):
+        # Одно постоянное соединение; при обрыве переподключаемся один раз.
+        for attempt in (1, 2):
+            try:
+                if self.conn is None or self.conn.closed:
+                    self.conn = self.psycopg.connect(
+                        self.conninfo, autocommit=True, row_factory=self.row_factory, **self.params
+                    )
+                with self.conn.cursor() as cursor:
+                    cursor.execute(query, params)
+                    return cursor.fetchone() if cursor.description else None
+            except self.psycopg.OperationalError:
+                if self.conn is not None:
+                    self.conn.close()
+                self.conn = None
+                if attempt == 2:
+                    raise
+
+    def get_user(self, user_id):
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return None
+        row = self._execute(
+            f"SELECT {', '.join(self.COLUMNS)} FROM users WHERE telegram_user_id = %s", (user_id,)
+        )
+        if row is None:
+            return None
+        row["registered_at"] = row["registered_at"].isoformat(timespec="seconds")
+        return row
+
+    def save_user(self, user):
+        columns = ", ".join(self.COLUMNS)
+        placeholders = ", ".join(f"%({name})s" for name in self.COLUMNS)
+        updates = ", ".join(f"{name} = EXCLUDED.{name}" for name in self.COLUMNS[1:])
+        self._execute(
+            f"INSERT INTO users ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT (telegram_user_id) DO UPDATE SET {updates}",
+            user,
+        )
+
+
+def create_user_store():
+    if APP_ENV == "production":
+        return PostgresUserStore()
+    if APP_ENV == "development":
+        return JsonUserStore(ACCESS_PATH)
+    raise RuntimeError(f"Неизвестное значение APP_ENV={APP_ENV!r}: ожидается development или production")
 
 
 def get_registered_user(user_id):
     if user_id is None:
         return None
-    return load_access_state().get("users", {}).get(str(user_id))
+    return USER_STORE.get_user(user_id)
 
 
 def save_registered_user(message, registration):
@@ -147,9 +276,7 @@ def save_registered_user(message, registration):
     if user_id is None:
         raise ValueError("Telegram не передал user_id")
 
-    state = load_access_state()
-    users = state.setdefault("users", {})
-    users[str(user_id)] = {
+    USER_STORE.save_user({
         "telegram_user_id": user_id,
         "username": str(sender.get("username") or ""),
         "telegram_first_name": str(sender.get("first_name") or ""),
@@ -158,9 +285,8 @@ def save_registered_user(message, registration):
         "position": registration["position"],
         "phones": registration["phones"],
         "language": registration["language"],
-        "registered_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    save_access_state(state)
+        "registered_at": datetime.now().replace(microsecond=0),
+    })
 
 
 def normalize_phone(value):
@@ -322,7 +448,7 @@ def process_registration_message(message):
             save_registered_user(message, state)
         except Exception as error:
             return (
-                f"⚠️ Не удалось сохранить регистрацию в access.json: {error}",
+                f"⚠️ Не удалось сохранить регистрацию: {error}",
                 phone_keyboard(language),
             )
 
@@ -1469,9 +1595,7 @@ def check_health(config):
 
 
 def is_allowed(config, chat_id, user_id=None):
-    if user_id is None:
-        return False
-    return str(user_id) in load_access_state().get("users", {})
+    return get_registered_user(user_id) is not None
 
 def handle_callback(config, callback):
     callback_id = callback.get("id")
@@ -1732,11 +1856,19 @@ def handle_message(config, message):
     telegram_call(config["telegram_bot_token"], "sendMessage", params)
 
 def main():
+    global USER_STORE
     try:
         config = load_config()
     except Exception as error:
         print(f"Ошибка конфигурации: {error}", file=sys.stderr)
         return 1
+
+    try:
+        USER_STORE = create_user_store()
+    except Exception as error:
+        print(f"Ошибка хранилища пользователей ({APP_ENV}): {error}", file=sys.stderr)
+        return 1
+    print(f"Режим {APP_ENV}: пользователи хранятся в {USER_STORE.describe()}", file=sys.stderr)
 
     token = config["telegram_bot_token"]
     offset = 0
